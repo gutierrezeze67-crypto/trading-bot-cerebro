@@ -1,0 +1,13 @@
+# Credenciales - NUNCA commitear
+.env
+config/settings.py
+config/firebase-service-account.json
+
+# Python
+__pycache__/
+*.pyc
+*.log
+
+# Datos generados en runtime (no son codigo fuente)
+data/
+latest_signal.json

@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Order Flow Master - Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;700;800&display=swap');
+
+        body {
+            background: #0a0b10;
+            font-family: 'Inter', sans-serif;
+        }
+
+        .font-mono {
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .signal-card {
+            background: #0c0d12;
+            border: 1px solid rgba(251, 191, 36, 0.3);
+            box-shadow: 0 0 30px rgba(251, 191, 36, 0.02);
+            transition: all 0.3s ease;
+        }
+
+        .signal-card:hover {
+            border-color: rgba(251, 191, 36, 0.5);
+            box-shadow: 0 0 40px rgba(251, 191, 36, 0.05);
+        }
+
+        .signal-card.long {
+            border-left: 3px solid #34d399;
+        }
+
+        .signal-card.short {
+            border-left: 3px solid #fb7185;
+        }
+
+        .pulse-dot {
+            animation: pulse 2s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+
+        .progress-bar {
+            transition: width 0.5s ease;
+        }
+
+        .signal-container {
+            max-height: 600px;
+            overflow-y: auto;
+            scrollbar-width: thin;
+            scrollbar-color: #1a1b23 #0a0b10;
+        }
+
+        .signal-container::-webkit-scrollbar {
+            width: 4px;
+        }
+
+        .signal-container::-webkit-scrollbar-track {
+            background: #0a0b10;
+        }
+
+        .signal-container::-webkit-scrollbar-thumb {
+            background: #1a1b23;
+            border-radius: 10px;
+        }
+
+        .slide-in {
+            animation: slideIn 0.4s ease forwards;
+        }
+
+        @keyframes slideIn {
+            0% { opacity: 0; transform: translateX(30px); }
+            100% { opacity: 1; transform: translateX(0); }
+        }
+    </style>
+</head>
+<body>
+    <div class="min-h-screen p-6">
+        <div class="max-w-6xl mx-auto">
+            <!-- Header del Panel -->
+            <div class="flex items-center justify-between mb-4">
+                <div class="flex items-center gap-3">
+                    <div class="flex items-center gap-1 bg-gray-900/60 border border-gray-800 rounded-lg p-1">
+                        <button class="px-4 py-1.5 text-[11px] font-bold rounded-md bg-amber-500/20 text-amber-400 border border-amber-500/30">
+                            📡 LIVE FEED SEÑALES
+                        </button>
+                    </div>
+                </div>
+                <div class="flex items-center gap-3">
+                    <span class="text-[10px] text-emerald-400 font-mono">🟢 ONLINE</span>
+                    <button onclick="toggleAlerts()" class="text-gray-500 hover:text-gray-300 transition text-sm">
+                        🔔
+                    </button>
+                </div>
+            </div>
+
+            <!-- Contenedor de Señales -->
+            <div id="signalsContainer" class="signal-container space-y-3 pr-2">
+                <div class="text-center text-gray-600 text-sm py-10 font-mono">
+                    Esperando señales de trading...
+                </div>
+            </div>
+
+            <!-- Footer -->
+            <div class="mt-4 flex items-center justify-between text-[9px] text-gray-600 font-mono border-t border-gray-900/60 pt-3">
+                <span>📊 Última actualización: <span id="lastUpdate">--</span></span>
+                <span>🔗 Conectado a <span class="text-amber-500">latest_signal.json</span></span>
+            </div>
+        </div>
+    </div>
+    <script>
+        let lastSignalId = null;
+        let alertEnabled = true;
+        let audioCtx = null;
+
+        function playChime() {
+            try {
+                if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                const oscillator = audioCtx.createOscillator();
+                const gainNode = audioCtx.createGain();
+                oscillator.connect(gainNode);
+                gainNode.connect(audioCtx.destination);
+                oscillator.frequency.value = 880;
+                oscillator.type = 'sine';
+                gainNode.gain.setValueAtTime(0.3, audioCtx.currentTime);
+                gainNode.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.3);
+                oscillator.start();
+                oscillator.stop(audioCtx.currentTime + 0.3);
+            } catch (e) {
+                // Silencioso si falla el audio (p.ej. sin interacción previa del usuario)
+            }
+        }
+
+        function formatPrice(price) {
+            const n = Number(price);
+            if (Number.isNaN(n)) return String(price);
+            return '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        }
+
+        function createSignalCard(signal) {
+            const decision = signal.decision || 'NO_TRADE';
+            if (decision === 'NO_TRADE') return null;
+
+            const isLong = decision === 'LONG';
+            const setupType = signal.setup_type || '?';
+            const conviction = signal.conviction || 0;
+            const entry = signal.entry_price || 0;
+            const sl = signal.stop_loss_price || 0;
+            const tp1 = signal.tp_levels?.[0]?.price || 0;
+            const rr = signal.risk_metrics?.r_multiple_tp1 || 0;
+
+            const historico = signal.analisis_historico || {};
+            const testeos = historico.testeos_previos ?? 'N/A';
+            const ultimaReaccion = historico.ultima_reaccion_velas ?? 'N/A';
+            const tpPromedio = historico.tp_promedio ?? 'N/A';
+            const tpMaximo = historico.tp_maximo ?? 'N/A';
+            const tipoReaccion = historico.tipo_reaccion ?? 'N/A';
+            const efectividad = historico.efectividad_texto ?? 'N/A';
+            const tpPromedioPct = historico.tp_promedio_porcentaje ?? 'N/A';
+            const tpMaximoPct = historico.tp_maximo_porcentaje ?? 'N/A';
+
+            const micro = signal.microestructura || {};
+            const volAbs = micro.volumen_absorcion_usd ?? 'N/A';
+            const cvdDelta = micro.cvd_delta ?? 'N/A';
+            const confluencias = micro.confluencias || '';
+
+            const progress = Math.min(Math.max(((entry - sl) / (tp1 - sl)) * 100, 5), 95) || 50;
+            const emoji = isLong ? '🐂' : '🐻';
+            const texto = isLong ? 'COMPRA' : 'VENTA';
+            const color = isLong ? 'emerald' : 'rose';
+
+            return `
+                <div class="signal-card slide-in p-3.5 rounded-lg bg-gray-950/80 border-amber-500/30 shadow-md shadow-amber-500/[0.02] flex flex-col gap-3 relative overflow-hidden transition duration-200 signal-${isLong ? 'long' : 'short'}">
+                    <div class="flex justify-between items-start">
+                        <div class="flex flex-col gap-0.5">
+                            <span class="text-[11px] font-black uppercase tracking-wide px-2 py-0.5 rounded flex items-center gap-1 bg-${color}-500/10 text-${color}-400 border border-${color}-900/30">
+                                ${emoji} ${isLong ? 'LONG' : 'SHORT'} / ${texto}
+                            </span>
+                            <span class="text-[9px] text-gray-500 font-mono">Hora: ${new Date().toLocaleTimeString()} (Temporalidad: ${signal.timeframe || '15m'}) · ${setupType}</span>
+                        </div>
+                        <span class="text-[9.5px] font-bold font-mono px-2 py-0.5 rounded uppercase bg-amber-500/10 text-amber-400 border border-amber-500/40 pulse-dot">
+                            ● ACTIVA / EN VIVO
+                        </span>
+                    </div>
+
+                    <div class="grid grid-cols-3 gap-2 text-center text-xs font-mono">
+                        <div class="bg-gray-900/40 border border-gray-900/60 rounded p-1.5 flex flex-col">
+                            <span class="text-[8px] text-gray-500 uppercase">Stop Loss</span>
+                            <span class="font-extrabold text-rose-400">${formatPrice(sl)}</span>
+                        </div>
+                        <div class="bg-[#11131a] border border-amber-500/20 rounded p-1.5 flex flex-col ring-1 ring-amber-500/10">
+                            <span class="text-[8px] text-amber-500 uppercase font-bold">Precio Entrada</span>
+                            <span class="font-black text-white">${formatPrice(entry)}</span>
+                        </div>
+                        <div class="bg-gray-900/40 border border-gray-900/60 rounded p-1.5 flex flex-col">
+                            <span class="text-[8px] text-gray-500 uppercase">Take Profit</span>
+                            <span class="font-extrabold text-emerald-400">${formatPrice(tp1)}</span>
+                        </div>
+                    </div>
+
+                    <div class="flex flex-col gap-1">
+                        <div class="flex justify-between text-[9px] font-mono text-gray-500 px-0.5">
+                            <span>SL (0%)</span>
+                            <span class="font-bold text-gray-300">Entrada</span>
+                            <span>TP (100%)</span>
+                        </div>
+                        <div class="w-full h-2 bg-gray-900 rounded-full overflow-hidden flex relative border border-gray-800/80">
+                            <div class="h-full rounded-full ${isLong ? 'bg-emerald-600' : 'bg-rose-600'} progress-bar" style="width: ${progress}%;"></div>
+                        </div>
+                    </div>
+
+                    <div class="bg-[#0b0c11] border border-gray-900/60 rounded p-2 flex flex-col gap-1.5 text-[10px] font-mono leading-tight">
+                        <div class="flex justify-between text-gray-400">
+                            <span class="flex items-center gap-1">
+                                <span class="text-amber-500">🔄</span>
+                                <span>Nivel Testeado: <b>${testeos}x</b></span>
+                            </span>
+                            <span class="text-gray-500">hace ${ultimaReaccion} velas</span>
+                        </div>
+
+                        <div class="flex justify-between items-center border-t border-gray-900/40 pt-1 text-gray-300">
+                            <span class="text-gray-500">📈 TP Histórico Promedio:</span>
+                            <span class="font-bold text-gray-200">${formatPrice(tpPromedio)} (+${tpPromedioPct}%)</span>
+                        </div>
+
+                        <div class="flex justify-between items-center text-amber-400">
+                            <span class="flex items-center gap-1">
+                                <span>🏆</span>
+                                <span class="font-bold">TP Histórico Máximo:</span>
+                            </span>
+                            <span class="font-extrabold bg-amber-500/10 border border-amber-500/20 rounded px-1.5 py-0.5">
+                                ${formatPrice(tpMaximo)} (+${tpMaximoPct}%)
+                            </span>
+                        </div>
+                        <div class="flex justify-between items-center text-[9px] text-gray-500">
+                            <span>Comportamiento: <i>${tipoReaccion}</i></span>
+                            <span class="text-emerald-400 font-bold">WR Histórico: ${efectividad}</span>
+                        </div>
+                    </div>
+
+                    <div class="flex flex-wrap items-center justify-between text-[9.5px] font-mono border-t border-gray-900/60 pt-2 text-gray-400">
+                        <div class="flex items-center gap-2">
+                            <span>Absorción: <strong class="text-amber-400">${typeof volAbs === 'number' ? volAbs.toLocaleString() : volAbs} USD</strong></span>
+                            <span class="text-gray-600">|</span>
+                            <span>CVD Δ: <strong class="${cvdDelta > 0 ? 'text-emerald-400' : 'text-rose-400'}">${typeof cvdDelta === 'number' ? (cvdDelta > 0 ? '+' : '') + cvdDelta.toLocaleString() : cvdDelta} USD</strong></span>
+                        </div>
+                    </div>
+
+                    <div class="flex flex-wrap gap-1 border-t border-gray-950/60 pt-2">
+                        ${confluencias ? confluencias.split(',').map(c => `<span class="bg-gray-900 border border-gray-800 text-gray-300 text-[8.5px] px-1.5 py-0.2 rounded font-mono">[${c.trim()}]</span>`).join('') : ''}
+                        <span class="bg-gray-900 border border-gray-800 text-gray-300 text-[8.5px] px-1.5 py-0.2 rounded font-mono">[Conviction: ${conviction}/10]</span>
+                        <span class="bg-gray-900 border border-gray-800 text-gray-300 text-[8.5px] px-1.5 py-0.2 rounded font-mono">[R:R ${rr}]</span>
+                    </div>
+                </div>
+            `;
+        }
+
+        async function fetchSignal() {
+            try {
+                const response = await fetch('latest_signal.json?' + Date.now());
+                if (!response.ok) throw new Error('No se pudo leer latest_signal.json');
+                const signal = await response.json();
+
+                const signalId = signal.timestamp || signal.entry_price || null;
+
+                if (signalId && signalId !== lastSignalId && signal.decision && signal.decision !== 'NO_TRADE') {
+                    lastSignalId = signalId;
+
+                    const container = document.getElementById('signalsContainer');
+                    const cardHTML = createSignalCard(signal);
+
+                    if (cardHTML) {
+                        const placeholder = container.querySelector('.text-center');
+                        if (placeholder) placeholder.remove();
+
+                        const card = document.createElement('div');
+                        card.innerHTML = cardHTML;
+                        container.insertBefore(card.firstElementChild, container.firstChild);
+
+                        while (container.children.length > 20) {
+                            container.lastElementChild?.remove();
+                        }
+
+                        if (alertEnabled) playChime();
+                        document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+                    }
+                } else if (signalId) {
+                    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+                }
+            } catch (error) {
+                console.log('Esperando señal...', error.message);
+            }
+        }
+
+        function toggleAlerts() {
+            alertEnabled = !alertEnabled;
+            const btn = document.querySelector('button[onclick="toggleAlerts()"]');
+            btn.textContent = alertEnabled ? '🔔' : '🔕';
+        }
+
+        setInterval(fetchSignal, 3000);
+        fetchSignal();
+        console.log('🚀 Dashboard de Señales iniciado');
+        console.log('📡 Monitoreando latest_signal.json');
+    </script>
+</body>
+</html>

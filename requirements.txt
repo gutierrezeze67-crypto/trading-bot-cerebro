@@ -1,0 +1,5 @@
+google-genai>=1.0
+pandas>=2.0
+numpy>=1.26
+aiohttp>=3.9
+firebase-admin>=6.5
