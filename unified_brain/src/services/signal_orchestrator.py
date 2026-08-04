@@ -188,10 +188,15 @@ class SignalOrchestrator:
             risk_config = self._effective_risk_config()
             risk_engine = self.risk_engine if risk_config is self.risk_engine.config else RiskEngine(risk_config)
 
-            scalp_signal, swing_signal = await asyncio.gather(
-                asyncio.to_thread(self.scalping_expert.analyze, snapshot),
-                asyncio.to_thread(self.swing_expert.analyze, snapshot),
-            )
+            # ScalpingExpert desactivado para este deployment: backtest real
+            # (walk-forward + out-of-time, ~465 trades) mostro PF 0.30 en
+            # cuentas de fondeo (FundedNext/FundingPips) -- los costos lo
+            # destruyen -- mientras que SwingExpert solo sostiene PF 2.65-3.00,
+            # y combinar ambos en el router diluye el resultado a PF 2.03. No
+            # se toca ScalpingExpert.analyze() ni el Router: scalping
+            # simplemente no le propone candidatos al router en este deploy.
+            scalp_signal = None
+            swing_signal = await asyncio.to_thread(self.swing_expert.analyze, snapshot)
 
             context = self.build_router_context(snapshot)
             decision = self.router.route(account, scalp_signal, swing_signal, context)
