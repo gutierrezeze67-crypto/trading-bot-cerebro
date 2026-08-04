@@ -26,7 +26,17 @@ class RiskConfig(BaseModel):
     max_trades_per_day: int = Field(gt=0, default=5)
     max_concurrent_positions: int = Field(gt=0, default=1)
     risk_pct_per_trade: float = Field(gt=0, le=1.0, default=0.005)
-    max_position_equity_pct: float = Field(gt=0, le=1.0, default=0.95)
+    max_position_equity_pct: float = Field(
+        gt=0,
+        le=10.0,
+        default=3.0,
+        description="Tope de exposicion nocional como multiplo de equity. Antes 0.95 (95%),"
+        " pensado para spot sin apalancamiento (Binance). En una cuenta CFD con margen"
+        " (ej. Vantage) tener notional > equity es normal y seguro -- el limite real de"
+        " riesgo lo pone risk_pct_per_trade (perdida en SL), no el notional bruto. 3.0"
+        " es un tope generoso pero no infinito, para seguir cazando errores de calculo"
+        " reales (ej. una señal con sl_distance absurdamente chico).",
+    )
     contract_value_per_price_unit: float = Field(
         gt=0,
         default=1.0,
