@@ -1,0 +1,40 @@
+# Valores reales, tomados de los input.*/default del Pine real pegado en la
+# conversacion ("EL SENSEI v3 - Scanner Institucional", //@version=6).
+# sensei_generator.enabled=true habilita el generador para scripts standalone
+# (validate_sensei_m5.py) -- swing_expert.confluence_enabled se queda en
+# false hasta el A/B en backtest_fused.py (no confundir los dos flags).
+
+sensei_generator:
+  enabled: true
+  enabled_timeframes: [15, 60, 240, 1440]  # 15m, 1h, 4h, 1D
+  piv_len: 3                 # input pivLen
+  bos_lookback: 20           # input bosLookback
+  hh_ll_period: 70           # input hhLlPeriod
+  atr_len: 14                # input atrLength
+  disp_multiplier: 1.2       # input dispMultiplier
+  require_disp: false        # input requireDisp
+  choch_window: 20           # input chochWindow
+  historical_zones: 90       # input historicalZones
+  max_ob_activos: 8          # input maxOBActivos
+  min_prob_ob: 50            # input minProbOB
+  cont_alta_th: 50.0         # input contAltaTH
+  cont_baja_th: 55.0         # input contBajaTH
+  min_risk_atr: 0.5          # input minRiskATR
+  weights:                   # input w1..w4 (suman 1.0)
+    w1: 0.35
+    w2: 0.25
+    w3: 0.25
+    w4: 0.15
+  fvg:
+    enabled: true             # input showFVG
+    max_fvg_activos: 10       # input maxFVGActivos
+
+# swing_expert.confluence_enabled: false a proposito -- ver
+# unified_brain/src/experts/swing_expert.py (sin tocar) y la decision de la
+# conversacion: no se activa hasta correr el A/B en backtest_fused.py.
+swing_expert:
+  confluence_enabled: false
+  confluence_min_score: 75
+  zone_weight: 0.6
+  internal_weight: 0.4
+  entry_type: "LIMIT_AT_ZONE_EDGE"

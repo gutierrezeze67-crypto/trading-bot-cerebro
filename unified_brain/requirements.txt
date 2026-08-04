@@ -1,0 +1,15 @@
+MetaTrader5>=5.0.45
+aiohttp>=3.9
+fastapi>=0.115
+python-dotenv>=1.0
+google-genai>=1.0
+mcp>=1.0
+numpy>=1.26
+orjson>=3.10
+pandas>=2.0
+pydantic>=2.0
+PyYAML>=6.0
+requests>=2.31
+structlog>=24.1
+uvicorn[standard]>=0.30
+websockets>=13.0

@@ -1,0 +1,48 @@
+# Umbrales de confluencia OB (SenseiZoneGenerator, M15) + OrderFlow
+# (OrderFlowEngine, M5) para scripts/backtest_ob_of_confluence.py.
+#
+# Filosofia: el OB de Sensei da la ZONA (donde), OrderFlow da la
+# CONFIRMACION (si hay actividad real de order flow respaldando esa zona
+# ahora mismo) -- ninguno dispara solo. Reusa niveles YA VALIDADOS de
+# config/constants.py en vez de inventar nuevos umbrales de riesgo.
+
+entry:
+  ob_min_probability: 50       # tasaCont dinamica minima de la zona (SenseiZone.probability, 0-100)
+  # Basta UNA de estas tres confirmaciones de OrderFlow (no las tres) para
+  # que una zona OB activa dispare una entrada:
+  confirm_with_absorption: true    # AbsorptionZone en la misma direccion (side) que el OB
+  confirm_with_delta_trap: true    # DeltaTrap (=stop run) en la misma direccion
+  confirm_with_cvd_trend: true     # CVD de la ventana reciente alineado con el side del OB
+  cvd_confirmation_bars: 5         # ventana (en velas M5) para juzgar "CVD alineado"
+  cooldown_bars_after_trade: 3     # velas M5 de enfriamiento tras cerrar un trade, evita reentradas inmediatas sobre la misma zona
+
+fvg:
+  # Confluencia alternativa: en vez de OB (SenseiZoneGenerator.zone_cache),
+  # usa los FVG que Sensei YA detecta (seccion 7 del Pine, SenseiZoneGenerator.
+  # get_fvgs()) pero nunca publicaba -- ver scripts/backtest_fvg_of_confluence.py.
+  # POC dentro del gap: ADAPTACION del indicador Pine "FVG Volume Profile
+  # [ChartPrime]" que pego el usuario -- ese indicador arma el volume profile
+  # con datos SUB-barra de la vela de desplazamiento (necesita tick/lower-tf
+  # data que no tenemos para los 11 meses completos, ver docstring del
+  # script). Aca el POC se acumula con las velas M5 reales que van
+  # solapando el rango del gap mientras sigue activo (ofd._volume_profile_core,
+  # mismo nucleo que usa OrderFlowEngine.get_footprint) -- "donde se
+  # concentro el volumen DENTRO del gap hasta ahora", no solo de la vela
+  # que lo creo. Distinto del Pine original, pero con datos reales, no
+  # inventados.
+  bins: 15                 # "Resolution" del indicador original
+  poc_tolerance_ticks: 20  # cuan cerca (en ticks) del POC debe estar el close para considerar "en el punto de control"
+
+risk:
+  # MISMOS niveles fijos ya validados para BTCUSDT en produccion -- ver
+  # config/constants.py::TP1_PIPS/SL_PIPS (RR 2:1, WR 57.7%/PF 1.43 Exness
+  # en backtest_standard_account.py). No se inventan umbrales nuevos.
+  tp_usd: 500.0
+  sl_usd: 250.0
+
+backtest:
+  max_concurrent_positions: 1
+  fee_rate: 0.0004        # config/constants.py::PAPER_FEE_RATE, por lado
+  slippage_pct: 0.0005    # config/constants.py::PAPER_SLIPPAGE_PCT, adverso
+  capital_base_usd: 50000.0
+  risk_pct_trade: 0.005   # normalizacion a R-multiple, mismo criterio que backtest_fused.py

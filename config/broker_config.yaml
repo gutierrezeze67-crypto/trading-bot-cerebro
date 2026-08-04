@@ -1,0 +1,41 @@
+# Configuracion de ejecucion por broker para MT5DirectExecutor
+# (unified_brain/execution/mt5_direct.py). Opcional -- si este archivo no
+# existe o esta mal formado, se usa la configuracion hardcodeada en
+# BROKER_CONFIG dentro de mt5_direct.py sin romper nada.
+#
+# Como se detecta el broker: por substring del nombre del servidor MT5
+# (ej. "VantageMarkets-Demo" matchea "vantage", "Exness-MT5Real8" matchea
+# "exness") -- minusculas, sin importar mayusculas en el YAML.
+#
+# Campos por broker:
+#   deviation:   tolerancia de slippage en puntos.
+#   filling:     IOC | FOK | RETURN (ver ORDER_FILLING_* de MetaTrader5).
+#   price_style: "tick" (price = tick.ask/bid, brokers ECN) o
+#                "zero"  (price = 0, deja que el servidor complete al precio
+#                de mercado -- util en brokers Market Maker/dealing desk
+#                donde pedir un precio exacto puede generar rechazo/demora).
+
+brokers:
+  vantage:
+    deviation: 50
+    filling: IOC
+    price_style: tick
+
+  exness:
+    deviation: 100
+    filling: FOK
+    price_style: zero
+    # Este config asume cuenta Raw/Zero/Pro (ECN). Con Exness Standard
+    # (dealing desk interno) la latencia de cierre sigue siendo alta pase
+    # lo que pase aca -- no es un parametro de request, es el modelo de
+    # ejecucion de esa cuenta. Ver docstring de mt5_direct.py.
+
+  icmarkets:
+    deviation: 30
+    filling: IOC
+    price_style: zero
+
+  pepperstone:
+    deviation: 30
+    filling: IOC
+    price_style: zero

@@ -1,0 +1,69 @@
+# Umbrales de OrderFlowEngine (Fase 1). Ver docstring de
+# unified_brain/src/schemas/market.py (seccion "OrderFlowEngine (Fase 1)")
+# para la nota completa de que es REAL y que es APROXIMADO con el dataset
+# disponible (klines Binance agregados -- config/paths.yaml:btcusd_order_flow
+# -- NO tick data ni L2). Donde existe un umbral ya validado en produccion
+# (config/constants.py, usado por SnapshotEngine en vivo) se reusa ese valor
+# en vez de inventar uno nuevo -- ver comentarios por seccion.
+
+absorption:
+  enabled: true
+  # percentile_threshold / flip_ratio_threshold: MISMOS valores que
+  # config/constants.py::ABSORPTION_PERCENTILE (95) / ABSORPTION_FLIP_RATIO
+  # (0.35), ya validados en produccion via SnapshotEngine._evaluar_absorcion
+  # -> ofd.evaluar_absorcion(). No se reinventan umbrales nuevos para offline.
+  percentile_threshold: 95
+  flip_ratio_threshold: 0.35
+  lookback_bars: 120          # ventana de percentil de volumen -- igual a SnapshotEngine (2h en velas 1m)
+  min_absorption_volume_usd: 500000  # filtro de ruido adicional: volume*close por debajo de esto se descarta (no esta en ofd.evaluar_absorcion, lo aplica OrderFlowEngine)
+
+exhaustion:
+  enabled: true
+  delta_divergence_pct: 0.7   # delta de la vela actual <= 30% del promedio reciente en esa direccion -- ver ofd.evaluar_exhaustion
+  volume_decay_pct: 0.5       # volumen de la vela actual <= 50% del promedio reciente
+  lookback_bars: 15
+
+footprint:
+  # Volume profile APROXIMADO sobre una ventana rolling de velas (ver nota
+  # de transparencia en schemas/market.py) -- NO es footprint intrabar real
+  # por nivel de precio (eso requiere tick data que no existe en este
+  # dataset). Reusa ofd.volume_profile() tal cual (bins/value_area_pct ya
+  # validados para el HTF en vivo -- ver SnapshotEngine._recalcular_htf).
+  tf_min: 1
+  lookback_bars: 30           # ventana rolling para POC/VAH/VAL (misma escala que SnapshotEngine.klines_1m[-30:] en get_live_snapshot)
+  bins: 50
+  va_pct: 0.7                 # Value Area 70%
+  tick_size: 0.1               # BTCUSDT -- ver config/constants.py::TICK_SIZE (0.1, no 0.01)
+
+cvd:
+  tf_min: 1
+  reset_session: true         # reset a las 00:00 UTC
+  session_hours: 24           # BTC 24/7 -- no hay sesion que anclar (ver SnapshotEngine._recompute_vwap_15m, mismo criterio)
+
+delta_trap:
+  # DeltaTrap = "Stop Run / Liquidity Sweep" ya validado en produccion --
+  # ver ofd.evaluar_stop_run(), reusado tal cual (formula fija, sin umbrales
+  # propios mas alla de la ventana de high/low previo). lookback_bars=20
+  # replica SnapshotEngine._evaluar_stop_run (list(klines_1m)[-20:], min 10).
+  enabled: true
+  lookback_bars: 20
+  min_bars_required: 10
+
+stack_imbalance:
+  # NO CALCULABLE con este dataset (klines agregados, sin trades por nivel
+  # de precio ni profundidad L2) -- ver StackImbalance en schemas/market.py
+  # y OrderFlowEngine.get_stack_imbalance(), que siempre devuelve None.
+  # Umbrales dejados documentados para cuando haya un feed real (SnapshotEngine
+  # en vivo SI tiene lo necesario via _evaluar_iceberg/book L2), no se usan hoy.
+  enabled: false
+  min_ratio: 1.8
+  min_volume_usd: 100000
+  price_levels_around: 5
+
+validation:
+  test_sample_size: 50000
+  # Rango real confirmado en el CSV M5 (BTCUSDT_5m_completo.csv, 96480 velas)
+  # -- NO 2024, el dataset institucional disponible cubre jul-2025/may-2026.
+  backtest_start: "2025-07-01"
+  backtest_end: "2026-05-31"
+  symbols: ["BTCUSDT"]

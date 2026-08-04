@@ -106,42 +106,49 @@ def load_symbol(symbol_dir: Path = DATA_DIR, files: dict = FILES) -> dict:
 # Volume Profile (POC / VAH / VAL) - aproximado
 # ----------------------------------------------------------------------
 
-def volume_profile(df: pd.DataFrame, bins: int = 50, value_area_pct: float = 0.70) -> dict:
-    if df.empty:
+def _volume_profile_core(
+    lows: np.ndarray, highs: np.ndarray, closes: np.ndarray, vols: np.ndarray,
+    bins: int = 50, value_area_pct: float = 0.70,
+) -> dict:
+    """Nucleo numerico de volume_profile() -- arrays numpy directos, SIN
+    pasar por un DataFrame. Extraido de volume_profile() (misma formula,
+    cero cambios de comportamiento) para poder llamarse desde un hot path
+    bar-a-bar (OrderFlowEngine._update_footprint, Fase 1) sin el overhead de
+    pandas por llamada: perfilado real, construir+indexar un DataFrame de
+    ~30 filas cuesta ~8ms/llamada (92 barras/s sobre 3000 barras reales) --
+    inviable para procesar un CSV de decenas de miles de velas. Con arrays
+    numpy directos el mismo calculo es ~2 ordenes de magnitud mas rapido."""
+    if len(closes) == 0:
         return {"poc": 0.0, "vah": 0.0, "val": 0.0}
 
-    # Filtro de outliers: una sola vela con un high/low corrupto (visto en
-    # vivo tras reconexiones de WebSocket) arrastra lo/hi del histograma
-    # entero y produce un VAL/VAH desconectado del rango real operado (ver
-    # comentario más abajo sobre "VAL=1283 con POC=63520" - mismo síntoma
-    # exacto reproducido en la práctica: VAL=1311 con POC=64895). Se
-    # descartan velas cuyo low/high se alejan más de 15% de la mediana de
-    # cierres de la ventana antes de construir los bins.
-    mediana = float(df["close"].median())
+    # Filtro de outliers -- ver docstring de volume_profile() para el porque.
+    mediana = float(np.median(closes))
     banda = mediana * 0.15
-    df_filtrado = df[(df["low"] >= mediana - banda) & (df["high"] <= mediana + banda)]
-    if not df_filtrado.empty:
-        df = df_filtrado
+    mask = (lows >= mediana - banda) & (highs <= mediana + banda)
+    if mask.any():
+        lows, highs, closes, vols = lows[mask], highs[mask], closes[mask], vols[mask]
 
-    lo, hi = float(df["low"].min()), float(df["high"].max())
+    lo, hi = float(lows.min()), float(highs.max())
     if hi <= lo:
-        precio = float(df["close"].iloc[-1])
+        precio = float(closes[-1])
         return {"poc": precio, "vah": precio, "val": precio}
 
     edges = np.linspace(lo, hi, bins + 1)
     vol_by_bin = np.zeros(bins)
 
-    lows = df["low"].to_numpy()
-    highs = df["high"].to_numpy()
-    vols = df["volume"].to_numpy()
-
-    for row_lo, row_hi, vol in zip(lows, highs, vols):
-        if row_hi <= row_lo or vol <= 0:
-            continue
-        i0 = max(0, min(int(np.searchsorted(edges, row_lo, side="right")) - 1, bins - 1))
-        i1 = max(0, min(int(np.searchsorted(edges, row_hi, side="right")) - 1, bins - 1))
-        span = i1 - i0 + 1
-        vol_by_bin[i0:i1 + 1] += vol / span
+    # searchsorted VECTORIZADO (un solo call para todas las filas, no uno
+    # por fila) + acumulacion sobre listas de Python planas (evita el
+    # overhead de escalares numpy en el loop) -- mismo resultado que la
+    # version fila-a-fila, perfilado real: esto es lo que hace viable llamar
+    # esto una vez POR BARRA desde OrderFlowEngine.on_bar_close(), no solo
+    # una vez cada 5 minutos como el HTF de SnapshotEngine.
+    valid = (highs > lows) & (vols > 0)
+    if valid.any():
+        i0_arr = np.clip(np.searchsorted(edges, lows[valid], side="right") - 1, 0, bins - 1)
+        i1_arr = np.clip(np.searchsorted(edges, highs[valid], side="right") - 1, 0, bins - 1)
+        for i0, i1, vol in zip(i0_arr.tolist(), i1_arr.tolist(), vols[valid].tolist()):
+            span = i1 - i0 + 1
+            vol_by_bin[i0:i1 + 1] += vol / span
 
     poc_idx = int(np.argmax(vol_by_bin))
     poc = float((edges[poc_idx] + edges[poc_idx + 1]) / 2)
@@ -174,6 +181,15 @@ def volume_profile(df: pd.DataFrame, bins: int = 50, value_area_pct: float = 0.7
     vah = float(edges[hi_idx + 1])
 
     return {"poc": round(poc, 2), "vah": round(vah, 2), "val": round(val, 2)}
+
+
+def volume_profile(df: pd.DataFrame, bins: int = 50, value_area_pct: float = 0.70) -> dict:
+    if df.empty:
+        return {"poc": 0.0, "vah": 0.0, "val": 0.0}
+    return _volume_profile_core(
+        df["low"].to_numpy(), df["high"].to_numpy(), df["close"].to_numpy(), df["volume"].to_numpy(),
+        bins=bins, value_area_pct=value_area_pct,
+    )
 
 
 def naked_pocs(df_htf: pd.DataFrame, max_results: int = 5) -> list:
@@ -321,6 +337,121 @@ def _mark_delta_divergence(velas: list) -> None:
             prev_deltas = [v["delta"] for v in velas[max(0, i - 5):i] if v["delta"] < 0]
             if prev_deltas and velas[i]["delta"] > min(prev_deltas):
                 velas[i]["div"] = True
+
+
+def volumen_percentil(volumen: float, ventana_volumenes: list[float]) -> float:
+    """Percentil (0-100) de `volumen` contra una ventana reciente de volúmenes.
+    Extraído de SnapshotEngine._volumen_percentil_2h() -- misma fórmula, sin
+    depender de self.klines_1m (recibe la ventana ya armada por el llamador,
+    para poder reusarse desde cualquier motor, no solo SnapshotEngine)."""
+    if len(ventana_volumenes) < 10:
+        return 0.0
+    ordenados = sorted(ventana_volumenes)
+    menor_o_igual = sum(1 for v in ordenados if v <= volumen)
+    return (menor_o_igual / len(ordenados)) * 100
+
+
+def evaluar_absorcion(
+    volume: float, close: float, rango: float, delta: float,
+    ventana_volumenes: list[float], percentile_threshold: float, flip_ratio_threshold: float,
+) -> bool:
+    """Absorción: volumen en percentil alto de la ventana reciente + flip
+    ratio (proporción del volumen en la dirección contraria al cierre) +
+    rango chico pese al volumen (proxy de "price stall", no tick data real).
+    Extraído de SnapshotEngine._evaluar_absorcion() -- MISMA fórmula, umbrales
+    como parámetros en vez de leer config.constants directo (este módulo no
+    depende de config, ver docstring del archivo)."""
+    if rango <= 0 or volume <= 0:
+        return False
+    if volumen_percentil(volume, ventana_volumenes) < percentile_threshold:
+        return False
+    flip_ratio = abs(delta) / volume
+    if flip_ratio <= flip_ratio_threshold:
+        return False
+    if rango >= close * 0.001:
+        return False
+    return True
+
+
+def evaluar_stop_run(high: float, low: float, close: float, delta: float, high_n: float, low_n: float) -> Optional[str]:
+    """Stop Run / Liquidity Sweep: la vela barre (wick) el high/low de una
+    ventana previa pero CIERRA de vuelta adentro (reclaim), con delta a favor
+    de la reversión. Extraído de SnapshotEngine._evaluar_stop_run() --
+    high_n/low_n son el high/low de la ventana previa, ya calculados por el
+    llamador (antes de incluir la vela actual, sin look-ahead)."""
+    if high_n is None or low_n is None:
+        return None
+    if high > high_n and close <= high_n and delta < 0:
+        return "SHORT"
+    if low < low_n and close >= low_n and delta > 0:
+        return "LONG"
+    return None
+
+
+def evaluar_breakout_vol(
+    close: float, delta: float, volume: float,
+    range_high_n: float, range_low_n: float, vol_prom_n: float,
+    range_pct_threshold: float = 0.003, vol_mult_threshold: float = 2.0,
+) -> Optional[str]:
+    """Ruptura con volumen: consolidación previa (rango chico) + esta vela
+    rompe con volumen >= vol_mult_threshold x el promedio + delta a favor de
+    la dirección de la ruptura. Extraído de SnapshotEngine._evaluar_breakout_vol()
+    -- misma fórmula, sin el filtro de imbalance por nivel (no calculable sin
+    tick data, ver docstring del módulo)."""
+    if range_high_n is None or range_low_n is None or close <= 0:
+        return None
+    rango_pct = (range_high_n - range_low_n) / close
+    if rango_pct > range_pct_threshold:
+        return None
+    if not vol_prom_n or vol_prom_n <= 0 or volume < vol_mult_threshold * vol_prom_n:
+        return None
+    if delta == 0:
+        return None
+    return "LONG" if delta > 0 else "SHORT"
+
+
+def evaluar_exhaustion(
+    closes: list, deltas: list, volumes: list,
+    delta_divergence_pct: float = 0.7, volume_decay_pct: float = 0.5,
+) -> Optional[str]:
+    """Agotamiento: la vela actual (ultimo elemento de cada lista, alineadas
+    por indice) hace un nuevo extremo de precio sobre la ventana previa
+    (closes[:-1]) pero con delta en esa direccion muy por debajo del
+    promedio reciente en la misma direccion (divergencia) Y volumen
+    decayendo vs el promedio reciente -- señal de que el impulso se esta
+    quedando sin combustible, NO una reversion confirmada (eso lo decide
+    quien consuma esto, ej. OrderFlowEngine._detectar_exhaustion).
+
+    direction devuelto: "SHORT" (nuevo high con compradores agotandose,
+    posible giro bajista) o "LONG" (nuevo low con vendedores agotandose,
+    posible giro alcista). None si no hay suficiente historia o ninguna de
+    las dos condiciones califica. Mismo patron que evaluar_stop_run/
+    evaluar_breakout_vol: funcion pura, umbrales como parametros explicitos,
+    sin depender de config."""
+    n = len(closes)
+    if n < 4 or len(deltas) != n or len(volumes) != n:
+        return None
+
+    close, delta, volume = closes[-1], deltas[-1], volumes[-1]
+    prev_closes, prev_deltas, prev_volumes = closes[:-1], deltas[:-1], volumes[:-1]
+
+    avg_volume = sum(prev_volumes) / len(prev_volumes)
+    if avg_volume <= 0 or volume > avg_volume * (1.0 - volume_decay_pct):
+        return None
+
+    if close > max(prev_closes) and delta > 0:
+        pos_deltas = [d for d in prev_deltas if d > 0]
+        avg_pos_delta = sum(pos_deltas) / len(pos_deltas) if pos_deltas else 0.0
+        if avg_pos_delta > 0 and delta <= avg_pos_delta * (1.0 - delta_divergence_pct):
+            return "SHORT"
+
+    if close < min(prev_closes) and delta < 0:
+        neg_deltas = [d for d in prev_deltas if d < 0]
+        avg_neg_delta = sum(neg_deltas) / len(neg_deltas) if neg_deltas else 0.0
+        if avg_neg_delta < 0 and delta >= avg_neg_delta * (1.0 - delta_divergence_pct):
+            return "LONG"
+
+    return None
 
 
 def tape_speed(df: pd.DataFrame, n: int = 5) -> int:

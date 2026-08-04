@@ -1,0 +1,24 @@
+# Registro de datasets locales para validacion offline (Sensei, backtests).
+# Rutas reales confirmadas en disco -- NO la estructura M1/M5/M15/H1 que se
+# asumio originalmente; son 4 archivos planos, formato Binance klines crudo
+# (12 columnas, sin header, timestamps en microsegundos -- ver
+# src/orderflow_data.load_klines()). El M1 esta corrupto en origen
+# (merge horizontal mal hecho, columnas de sobra) -- load_klines() lo tolera
+# descartando filas invalidas, pero no se uso para nada todavia.
+
+btcusd_order_flow:
+  data_root: "C:/Users/ezequiel/OneDrive/Desktop/DATA CSV/BTCUSD/BTCUSD dataset de Order Flow (Flujo de Órdenes) completo de nivel institucional"
+  csv:
+    m1: "BTCUSDT_M1_1year_completo.csv"   # CORRUPTO en origen, ver nota arriba
+    m5: "BTCUSDT_5m_completo.csv"
+    m15: "BTCUSDT_15m_completo.csv"       # pre-agregado -- no se usa como fuente (Sensei agrega desde m5)
+    h1: "BTCUSDT_1h_completo.csv"         # idem
+  format: binance
+
+xauusd_mt5:
+  data_root: "C:/Users/ezequiel/OneDrive/Desktop/DATA CSV"
+  csv:
+    m5: "XAUUSD_M5_5Y.csv"
+  format: mt5
+
+validation_output: "validation_output"

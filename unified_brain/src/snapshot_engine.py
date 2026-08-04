@@ -132,6 +132,23 @@ class SnapshotEngine:
         self._candles_15m: deque = deque(maxlen=500)
         self._m15_buffer: list = []
 
+        # Agregador dedicado a SenseiZoneGenerator (15m/1h/4h/1D), alineado a
+        # bordes REALES de reloj UTC (:00/:15/:30/:45 para 15m, etc.) -- a
+        # diferencia de _candles_15m/_candles_30m/_candles_h4 de arriba, que
+        # agrupan por CANTIDAD de velas 1m cerradas desde que arranco el
+        # motor (ya validado asi para ATR30m/swings H4/atr14_15m/vwap_15m,
+        # no se toca). Un conteo simple daria velas Sensei desalineadas de
+        # las de TradingView -- Pine SIEMPRE alinea a reloj real, y el motor
+        # puede arrancar en cualquier momento del dia -- asi que Sensei
+        # necesita su propia logica de bucket, no puede reusar la existente.
+        # Ver _flush_sensei_bucket().
+        self._sensei_tf_seconds = {15: 900, 60: 3600, 240: 14400, 1440: 86400}
+        self._sensei_current_bucket: dict[int, dict | None] = {tf: None for tf in self._sensei_tf_seconds}
+        self._sensei_candles: dict[int, deque] = {
+            15: deque(maxlen=300), 60: deque(maxlen=500), 240: deque(maxlen=500), 1440: deque(maxlen=400),
+        }
+        self._closed_tfs_this_close: list[int] = []
+
         # Cola de patrones detectados (absorción/imbalance apilado/iceberg) -
         # se llena al cerrar una vela que califica, no en cada trade (ver
         # _cerrar_vela_actual). El consumidor hace queue.get() bloqueante sin
@@ -360,7 +377,11 @@ class SnapshotEngine:
     @staticmethod
     def _nueva_vela_acumulador() -> dict:
         return {
-            "open_time": None, "high": None, "low": None, "close": None,
+            # "open" es NUEVO -- el acumulador original nunca lo guardaba
+            # (solo high/low/close), porque nada lo necesitaba hasta
+            # SenseiZoneGenerator (su deteccion de Order Blocks depende de
+            # close[1] < open[1], no se puede portear sin esto).
+            "open_time": None, "open": None, "high": None, "low": None, "close": None,
             "volume": 0.0, "buy_vol": 0.0, "sell_vol": 0.0,
             "trades_por_precio": {},  # precio redondeado -> {"buy": x, "sell": y}
         }
@@ -392,6 +413,7 @@ class SnapshotEngine:
         vela = self._vela_actual
         if vela["open_time"] is None:
             vela["open_time"] = ts
+            vela["open"] = price
             self._vela_cierre_ts = (int(ts // 60) + 1) * 60  # próximo borde de minuto UTC
         vela["high"] = price if vela["high"] is None else max(vela["high"], price)
         vela["low"] = price if vela["low"] is None else min(vela["low"], price)
@@ -437,6 +459,7 @@ class SnapshotEngine:
 
         candle = {
             "t": datetime.fromtimestamp(vela["open_time"], tz=timezone.utc).strftime("%H:%M:%S"),
+            "open": round(vela["open"], 2) if vela["open"] is not None else round(vela["close"], 2),
             "c": round(vela["close"], 2),
             "delta": round(delta, 4),
             "vol": round(vela["volume"], 4),
@@ -456,9 +479,18 @@ class SnapshotEngine:
         self.klines_1m.append(candle)
         self._vela_actual = self._nueva_vela_acumulador()
 
+        # Se resetea en cada cierre de vela 1m -- la gran mayoria de los
+        # cierres no cierran ningun TF mayor, asi que esto queda [] casi
+        # siempre. Ver bars_multi_tf()/closed_timeframes_this_close() abajo,
+        # consumido por MarketSnapshot.from_snapshot_engine() para
+        # SenseiZoneGenerator.
+        self._closed_tfs_this_close = []
+
         # Agregación M30 -> H4 para el filtro institucional (ATR30m + swings
         # H4). Se hace acá, no en un loop aparte, para no depender de otro
         # timer más - ya estamos cerrando la vela 1m que dispara todo esto.
+        # SIN CAMBIOS -- esto sigue siendo count-based, tal cual estaba
+        # validado antes de esta sesion.
         self._m30_buffer.append(candle)
         if len(self._m30_buffer) == 30:
             m30 = self._aggregate_to_m30(self._m30_buffer)
@@ -475,6 +507,7 @@ class SnapshotEngine:
 
         # Agregación M15 -> atr14_15m (precio) + vwap_15m, solo para
         # HTFFundingBrain.decide() (ver comentario de _candles_15m arriba).
+        # SIN CAMBIOS -- count-based, validado, no lo toca Sensei.
         self._m15_buffer.append(candle)
         if len(self._m15_buffer) == 15:
             m15 = self._aggregate_to_m30(self._m15_buffer)  # generica, no hardcodea "30" pese al nombre
@@ -483,28 +516,85 @@ class SnapshotEngine:
             self._recompute_atr14_15m()
             self._recompute_vwap_15m()
 
+        # Agregador Sensei, alineado a reloj real (ver _flush_sensei_bucket
+        # y el comentario de self._sensei_tf_seconds en __init__) -- TOTALMENTE
+        # separado de lo de arriba, para no arriesgar el baseline validado.
+        for tf_min, tf_seconds in self._sensei_tf_seconds.items():
+            self._flush_sensei_bucket(tf_min, tf_seconds, candle)
+
         self._evaluar_patron(candle)
 
+    def _flush_sensei_bucket(self, tf_min: int, tf_seconds: int, candle: dict) -> None:
+        """Acumula `candle` (vela 1m recien cerrada) en el bucket de TF
+        tf_min alineado a reloj real UTC (bucket_start = floor(open_time /
+        tf_seconds) * tf_seconds -- mismo criterio que usa cualquier
+        exchange/TradingView para sus velas). Si esta vela 1m pertenece a un
+        bucket nuevo, el bucket ANTERIOR se cierra y se publica en
+        self._sensei_candles[tf_min] -- EXCEPTO la primera vez que se ve un
+        bucket para ese TF (arranque del motor, bucket real pero parcial
+        porque recien empieza a mitad de ese periodo).
+
+        Version anterior exigia count == cantidad exacta de velas 1m
+        esperadas (60 para 1h, 1440 para 1D) para considerar un bucket
+        "completo". Sonaba razonable pero en datos reales (reconexiones del
+        WS, gaps del feed) casi ningun bucket largo tiene el conteo exacto
+        -- confirmado corriendo scripts/validate_sensei_m5.py sobre 2.5 anios
+        reales de XAUUSD: CERO velas de 1D se publicaban nunca con ese
+        criterio. TradingView tampoco exige un conteo exacto -- agrega lo
+        que haya ocurrido en la ventana de reloj, gaps incluidos."""
+        ts = candle["_open_time"]
+        bucket_start = (ts // tf_seconds) * tf_seconds
+        current = self._sensei_current_bucket[tf_min]
+
+        if current is None or current["open_time"] != bucket_start:
+            if current is not None and not current["is_first"]:
+                self._sensei_candles[tf_min].append(current)
+                self._closed_tfs_this_close.append(tf_min)
+            self._sensei_current_bucket[tf_min] = {
+                "open_time": bucket_start, "open": candle["open"],
+                "high": candle["_high"], "low": candle["_low"], "close": candle["c"],
+                "volume": candle["vol"], "delta": candle["delta"], "count": 1,
+                "is_first": current is None,
+            }
+            return
+
+        current["high"] = max(current["high"], candle["_high"])
+        current["low"] = min(current["low"], candle["_low"])
+        current["close"] = candle["c"]
+        current["volume"] += candle["vol"]
+        current["delta"] += candle["delta"]
+        current["count"] += 1
+
+    # ------------------------------------------------------------------
+    # Multi-TF para SenseiZoneGenerator -- NUEVO. Copias de solo lectura,
+    # nunca los deques vivos del engine.
+    # ------------------------------------------------------------------
+
+    def bars_multi_tf(self) -> dict:
+        """Ultimas velas OHLC cerradas por timeframe (minutos: 15/60/240/1440),
+        alineadas a reloj real UTC (ver _flush_sensei_bucket), listas para
+        MarketSnapshot.from_snapshot_engine() -> BarData. Hasta esta version
+        no habia forma de sacar velas multi-TF reales del motor -- solo
+        escalares agregados (poc/atr14_15m/etc, ver self.htf)."""
+        return {tf: list(dq) for tf, dq in self._sensei_candles.items()}
+
+    def closed_timeframes_this_close(self) -> list[int]:
+        """Que TFs (15/60/240/1440) cerraron vela en el ULTIMO
+        _cerrar_vela_actual() -- vacio la gran mayoria de los cierres."""
+        return list(self._closed_tfs_this_close)
+
     def _evaluar_stop_run(self, candle: dict) -> Optional[str]:
-        """Stop Run / Liquidity Sweep v2: la vela barre (wick) el high/low de
-        las últimas 20 velas pero CIERRA de vuelta dentro de ese rango
-        (reclaim), con delta neto a favor de la reversión - la firma real de
-        una corrida de stops que se revierte, no una ruptura genuina."""
+        """Stop Run / Liquidity Sweep v2 -- delega a ofd.evaluar_stop_run()
+        (formula real, extraida aca para poder reusarse desde OrderFlowEngine
+        sin duplicarla)."""
         previas = list(self.klines_1m)[-20:]
         if len(previas) < 10:
             return None
-
         high_20 = max(v["_high"] for v in previas if v["_high"] is not None)
         low_20 = min(v["_low"] for v in previas if v["_low"] is not None)
-        vela_high, vela_low = candle["_high"], candle["_low"]
-        if vela_high is None or vela_low is None:
+        if candle["_high"] is None or candle["_low"] is None:
             return None
-
-        if vela_high > high_20 and candle["c"] <= high_20 and candle["delta"] < 0:
-            return "SHORT"
-        if vela_low < low_20 and candle["c"] >= low_20 and candle["delta"] > 0:
-            return "LONG"
-        return None
+        return ofd.evaluar_stop_run(candle["_high"], candle["_low"], candle["c"], candle["delta"], high_20, low_20)
 
     def _evaluar_initiative_pullback(self, candle: dict) -> Optional[str]:
         """Pullback a zona de valor HTF (POC/VAL/VAH) con el delta contra-
@@ -541,32 +631,28 @@ class SnapshotEngine:
 
     def _evaluar_breakout_vol(self, candle: dict) -> Optional[str]:
         """Consolidación (rango de las últimas 10 velas < 0.3%) + esta vela
-        rompe con volumen >= 2x el promedio + imbalance en la dirección de
-        la ruptura - evita perseguir movimientos sin volumen real detrás."""
+        rompe con volumen >= 2x el promedio (core delegado a
+        ofd.evaluar_breakout_vol(), reusable desde OrderFlowEngine) + filtro
+        EXTRA de imbalance en la dirección de la ruptura -- ese filtro
+        necesita datos de tape/L2 reales (candle["imb"]) que solo existen
+        acá en vivo, no se movió al módulo compartido."""
         previas = list(self.klines_1m)[-10:]
         if len(previas) < 10:
             return None
 
         highs = [v["_high"] for v in previas if v["_high"] is not None]
         lows = [v["_low"] for v in previas if v["_low"] is not None]
-        if not highs or not lows or candle["c"] <= 0:
-            return None
-
-        rango_pct = (max(highs) - min(lows)) / candle["c"]
-        if rango_pct > 0.003:
+        if not highs or not lows:
             return None
 
         vol_prom = sum(v["vol"] for v in previas) / len(previas)
-        if vol_prom <= 0 or candle["vol"] < 2.0 * vol_prom:
+        direccion = ofd.evaluar_breakout_vol(candle["c"], candle["delta"], candle["vol"], max(highs), min(lows), vol_prom)
+        if direccion is None:
             return None
 
-        if candle["delta"] == 0:
-            return None
-        direccion = "LONG" if candle["delta"] > 0 else "SHORT"
         lado_esperado = "bid" if direccion == "LONG" else "ask"
         if not any(imb.get("s") == lado_esperado for imb in candle["imb"]):
             return None
-
         return direccion
 
     def _evaluar_liquidity_zone(self, candle: dict) -> Optional[dict]:
@@ -586,40 +672,15 @@ class SnapshotEngine:
 
     def _volumen_percentil_2h(self, volumen: float) -> float:
         """Percentil del volumen dado contra las últimas 120 velas 1m (2hs)
-        ya cerradas - "volumen extremo" real relativo a la sesión reciente,
-        no un umbral fijo ni el top 5% de todo lo que se cargó alguna vez."""
-        ventana = list(self.klines_1m)[-120:]
-        if len(ventana) < 10:
-            return 0.0
-        volumenes = sorted(v["vol"] for v in ventana)
-        menor_o_igual = sum(1 for v in volumenes if v <= volumen)
-        return (menor_o_igual / len(volumenes)) * 100
+        ya cerradas -- delega a ofd.volumen_percentil()."""
+        ventana = [v["vol"] for v in list(self.klines_1m)[-120:]]
+        return ofd.volumen_percentil(volumen, ventana)
 
     def _evaluar_absorcion(self, vela: dict, delta: float, rango: float) -> bool:
-        """Absorción v2: volumen en percentil >=95 de las últimas 2hs +
-        "stall" de precio (rango chico pese al volumen; no tenemos ticks
-        individuales de precio dentro de la vela, así que se aproxima con
-        rango/precio, no un conteo literal de ticks) + delta flip ratio
-        (proporción del volumen que fue en la dirección contraria al cierre,
-        es decir que "se absorbió" sin mover el precio)."""
-        if rango <= 0 or vela["volume"] <= 0:
-            return False
-
-        percentil = self._volumen_percentil_2h(vela["volume"])
-        if percentil < c.ABSORPTION_PERCENTILE:
-            return False
-
-        flip_ratio = abs(delta) / vela["volume"]
-        if flip_ratio <= c.ABSORPTION_FLIP_RATIO:
-            return False
-
-        # Proxy de "price stall": rango de la vela chico en relación al precio,
-        # pese al volumen extremo - la firma real de que el mercado absorbió
-        # la agresión sin dejar avanzar el precio.
-        if rango >= vela["close"] * 0.001:
-            return False
-
-        return True
+        """Absorción v2 -- delega a ofd.evaluar_absorcion() (formula real,
+        extraida para reusarse desde OrderFlowEngine sin duplicarla)."""
+        ventana = [v["vol"] for v in list(self.klines_1m)[-120:]]
+        return ofd.evaluar_absorcion(vela["volume"], vela["close"], rango, delta, ventana, c.ABSORPTION_PERCENTILE, c.ABSORPTION_FLIP_RATIO)
 
     def _evaluar_patron(self, candle: dict) -> None:
         """Si la vela recién cerrada califica como patrón accionable, pushea
@@ -711,10 +772,14 @@ class SnapshotEngine:
         logger.info(f"📊 HTF recalculado: POC={vp['poc']} VAH={vp['vah']} VAL={vp['val']}")
 
     def _aggregate_to_m30(self, candles_1m: list) -> dict:
-        """Agrega 30 velas 1m cerradas -> 1 vela M30 (solo los campos que
-        ATR/swing necesitan: high/low/close/volume/delta)."""
+        """Agrega N velas 1m cerradas -> 1 vela agregada (generica pese al
+        nombre: se usa tanto para M30 -- history original -- como para 1h y
+        15m -- ver _cerrar_vela_actual). "open" es el open de la PRIMERA
+        vela del grupo (agregado desde candle["open"], ver
+        _nueva_vela_acumulador)."""
         return {
             "open_time": candles_1m[-1]["_open_time"],
+            "open": candles_1m[0].get("open", candles_1m[0]["c"]),
             "high": max(v["_high"] for v in candles_1m if v["_high"] is not None),
             "low": min(v["_low"] for v in candles_1m if v["_low"] is not None),
             "close": candles_1m[-1]["c"],
@@ -723,9 +788,12 @@ class SnapshotEngine:
         }
 
     def _aggregate_to_h4(self, candles_m30: list) -> dict:
-        """Agrega 4 velas M30 -> 1 vela H4."""
+        """Agrega N velas ya-agregadas (shape de _aggregate_to_m30) -> 1 vela
+        de TF mayor. Generica pese al nombre: se usa tanto para 4xM30->H4
+        (uso original) como para 6xH4->1D (ver _cerrar_vela_actual)."""
         return {
             "open_time": candles_m30[-1]["open_time"],
+            "open": candles_m30[0].get("open", candles_m30[0]["close"]),
             "high": max(v["high"] for v in candles_m30),
             "low": min(v["low"] for v in candles_m30),
             "close": candles_m30[-1]["close"],

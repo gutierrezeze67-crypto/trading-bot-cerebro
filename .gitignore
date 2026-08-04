@@ -2,6 +2,7 @@
 .env
 config/settings.py
 config/firebase-service-account.json
+scripts/test_mcp_final.py  # tiene login/password de la cuenta MT5 demo hardcodeados a pedido
 
 # Python
 __pycache__/
@@ -11,3 +12,9 @@ __pycache__/
 # Datos generados en runtime (no son codigo fuente)
 data/
 latest_signal.json
+config/liquidity_zones.json
+config/zone_stats_cache.json
+zone_performance_report.json
+
+# Frontend: repo git independiente propio (institutional-liquidity-engine), no trackear aca
+frontend/

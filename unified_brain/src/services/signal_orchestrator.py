@@ -22,9 +22,12 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Protocol
 
 import structlog
+
+if TYPE_CHECKING:
+    from src.services.sensei_zone_generator import SenseiZoneGenerator
 
 from src.execution.mcp_dispatcher import KNOWN_ERROR_HINTS, ExecutionResult, MCPDispatcher
 from src.execution.mt5_direct import MT5DirectExecutor, OrderResult as DirectOrderResult
@@ -34,6 +37,7 @@ from src.risk.risk_engine import RiskEngine
 from src.schemas.market import MarketSnapshot
 from src.schemas.risk import AccountState, RiskConfig
 from src.schemas.signals import UnifiedSignal
+from src.services.zone_cache import ZoneCache
 
 logger = structlog.get_logger(__name__)
 
@@ -110,6 +114,8 @@ class SignalOrchestrator:
         on_trade_executed: Callable[[ExecutionResult], None] | None = None,
         direct_executor: MT5DirectExecutor | None = None,
         risk_overrides_provider: Callable[[], dict[str, float]] | None = None,
+        zone_cache: ZoneCache | None = None,
+        sensei_generator: "SenseiZoneGenerator | None" = None,
     ) -> None:
         self.scalping_expert = scalping_expert
         self.swing_expert = swing_expert
@@ -131,6 +137,20 @@ class SignalOrchestrator:
         # no cosmeticos: se aplican en CADA tick sobre self.risk_engine.config
         # (que nunca se muta, se copia). Ver _effective_risk_config().
         self.risk_overrides_provider = risk_overrides_provider
+        # Cache de zonas Sensei -- NADA la puebla ni la consulta todavia
+        # (ni SwingExpert.analyze() ni ningun generador real existen aun).
+        # Instanciada aca solo para tener el ciclo de vida (cleanup_old por
+        # tick) listo antes de conectar la logica real -- ver
+        # src/schemas/sensei_zones.py y src/services/zone_cache.py.
+        self.zone_cache = zone_cache if zone_cache is not None else ZoneCache()
+        # Generador Sensei -- opcional, None por default (nadie lo instancia
+        # todavia en build_default_orchestrator). Si esta seteado, se llama
+        # on_bar_close() por cada TF que cerro en el tick (snapshot.closed_timeframes),
+        # ANTES de swing_expert.analyze() -- swing_expert.analyze() sigue sin
+        # consultar zone_cache (confluence_enabled sigue en false), asi que
+        # esto no cambia ningun resultado de decision todavia, solo puebla la
+        # cache para cuando se conecte de verdad.
+        self.sensei_generator = sensei_generator
 
     def _effective_risk_config(self) -> RiskConfig:
         if self.risk_overrides_provider is None:
@@ -155,6 +175,14 @@ class SignalOrchestrator:
     async def process_market_tick(self, snapshot: MarketSnapshot) -> None:
         log = logger.bind(ts_ms=snapshot.ts_ms, symbol=snapshot.symbol)
         try:
+            self.zone_cache.cleanup_old(snapshot.ts_ms)
+
+            if self.sensei_generator is not None:
+                for tf_min in snapshot.closed_timeframes:
+                    bar = snapshot.get_last_closed_bar(tf_min)
+                    if bar is not None:
+                        self.sensei_generator.on_bar_close(snapshot.symbol, tf_min, bar)
+
             account = await self._account_cache.get()
 
             risk_config = self._effective_risk_config()

@@ -77,7 +77,7 @@ def _load_broker_config_overrides() -> dict[str, dict[str, Any]]:
     """Lee config/broker_config.yaml si existe. Opcional a proposito: si no
     esta, no parsea, o le falta algun campo, se usa BROKER_CONFIG tal cual
     esta arriba -- nunca rompe el arranque por un YAML mal escrito."""
-    path = Path(__file__).resolve().parents[2] / "config" / "broker_config.yaml"
+    path = Path(__file__).resolve().parents[3] / "config" / "broker_config.yaml"
     if not path.exists():
         return {}
     try:
