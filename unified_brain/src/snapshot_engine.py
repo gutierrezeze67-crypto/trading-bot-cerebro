@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 COMBINED_WS_URL_TMPL = "wss://fstream.binance.com/stream?streams={streams}"
 DEPTH_REST_URL_TMPL = "https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit=1000"
+KLINES_REST_URL_TMPL = "https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=1m&limit={limit}"
 
 MAX_TRADES_BUFFER = 20_000
 MAX_KLINES_1M = 250  # suficiente para resamplear ~80 velas de 3m
@@ -168,6 +169,7 @@ class SnapshotEngine:
         if self._running:
             return
         self._running = True
+        await self._backfill_klines_1m()
         self._tasks = [
             asyncio.create_task(self._run_forever(), name="ws_loop"),
             asyncio.create_task(self._periodic_htf(), name="htf_loop"),
@@ -233,6 +235,59 @@ class SnapshotEngine:
     # ------------------------------------------------------------------
     # Order book (bootstrap REST + aplicación de diffs, con detección de gaps)
     # ------------------------------------------------------------------
+
+    async def _backfill_klines_1m(self) -> None:
+        """Trae por REST las últimas MAX_KLINES_1M velas 1m ya cerradas
+        antes de arrancar el WS en vivo, para que un reinicio del servicio
+        no vuelva a pagar el warmup de HTF_READY_MINUTES minutos (ver
+        htf_listo()) -- con la estrategia swing-only (scalping
+        desactivado) el motor es muy selectivo, perder esa ventana puede
+        costar la única señal del día.
+
+        Usa datos reales de Binance (las mismas velas 1m que ya consume
+        todo el pipeline), no datos inventados: delta se deriva del taker
+        buy/sell volume que ya devuelve el REST de klines (mismo criterio
+        agresor/no-agresor que usa el WS de trades, solo que agregado por
+        Binance en vez de trade a trade). Lo único que NO se puede
+        reconstruir por REST es el detalle por nivel de precio
+        (imbalances de book) y iceberg (requieren L2 en vivo) -- quedan
+        vacíos/neutros en las velas de backfill: no hay ese dato
+        histórico, no se inventa."""
+        loop = asyncio.get_event_loop()
+        url = KLINES_REST_URL_TMPL.format(symbol=self.symbol, limit=MAX_KLINES_1M)
+        try:
+            resp = await loop.run_in_executor(None, lambda: requests.get(url, timeout=15))
+            raw = resp.json()
+        except Exception as e:
+            logger.error(f"❌ Error trayendo backfill REST de klines 1m: {e}")
+            return
+
+        if not isinstance(raw, list) or not raw:
+            logger.warning("⚠️ Backfill REST de klines 1m vacío o inválido, arranca en frío")
+            return
+
+        ahora_ms = time.time() * 1000
+        for k in raw:
+            open_time_ms, o, h, l, c_, vol, close_time_ms, _, _, taker_buy_vol, *_ = k
+            if close_time_ms > ahora_ms:
+                # Vela todavía en formación en Binance -- no cerrada, no se
+                # backfillea (la va a cerrar el WS en vivo apenas arranque).
+                continue
+            buy_vol = float(taker_buy_vol)
+            volume = float(vol)
+            vela = {
+                "open_time": open_time_ms / 1000,
+                "open": float(o), "high": float(h), "low": float(l), "close": float(c_),
+                "volume": volume, "buy_vol": buy_vol, "sell_vol": max(volume - buy_vol, 0.0),
+                "trades_por_precio": {},
+            }
+            self._cerrar_vela(vela, es_backfill=True)
+
+        self._recalcular_htf()
+        logger.info(
+            f"🕯️ Backfill REST completo: {len(self.klines_1m)} velas 1m cargadas "
+            f"({'HTF listo' if self.htf_listo() else 'HTF aún no listo'})"
+        )
 
     async def _bootstrap_orderbook(self) -> None:
         """Snapshot REST del book, requerido por Binance antes de aplicar el
@@ -443,7 +498,18 @@ class SnapshotEngine:
         vela = self._vela_actual
         if vela["open_time"] is None:
             return
+        self._cerrar_vela(vela)
+        self._vela_actual = self._nueva_vela_acumulador()
 
+    def _cerrar_vela(self, vela: dict, es_backfill: bool = False) -> dict:
+        """Construye la vela cerrada (candle dict) a partir de un
+        acumulador `vela` (mismo shape que _nueva_vela_acumulador) y la
+        enchufa en todo el pipeline: klines_1m, agregación M30/H4/M15,
+        Sensei y detección de patrones. Compartido entre el cierre en vivo
+        (_cerrar_vela_actual, vela=self._vela_actual) y el backfill REST al
+        arrancar (_backfill_klines_1m, vela viene de un kline REST de
+        Binance). es_backfill=True evita disparar _evaluar_patron(): una
+        vela de hace 3 horas no debe generar una señal de trading ahora."""
         delta = vela["buy_vol"] - vela["sell_vol"]
 
         imbalances = []
@@ -477,7 +543,6 @@ class SnapshotEngine:
         candle["liquidity_zone"] = self._evaluar_liquidity_zone(candle)
 
         self.klines_1m.append(candle)
-        self._vela_actual = self._nueva_vela_acumulador()
 
         # Se resetea en cada cierre de vela 1m -- la gran mayoria de los
         # cierres no cierran ningun TF mayor, asi que esto queda [] casi
@@ -522,7 +587,9 @@ class SnapshotEngine:
         for tf_min, tf_seconds in self._sensei_tf_seconds.items():
             self._flush_sensei_bucket(tf_min, tf_seconds, candle)
 
-        self._evaluar_patron(candle)
+        if not es_backfill:
+            self._evaluar_patron(candle)
+        return candle
 
     def _flush_sensei_bucket(self, tf_min: int, tf_seconds: int, candle: dict) -> None:
         """Acumula `candle` (vela 1m recien cerrada) en el bucket de TF
