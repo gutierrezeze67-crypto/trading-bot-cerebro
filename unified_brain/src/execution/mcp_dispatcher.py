@@ -55,7 +55,7 @@ import structlog
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client as streamablehttp_client
 from pydantic import BaseModel, Field
 
 from src.schemas.risk import AccountState
