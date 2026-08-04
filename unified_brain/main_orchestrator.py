@@ -24,6 +24,7 @@ from src.risk.risk_engine import RiskEngine
 from src.risk.risk_manager import RiskManager
 from src.router.deterministic_router import DeterministicRouter, RouterContext
 from src.schemas.market import MarketSnapshot
+from src.schemas.risk import AccountState
 from src.services.signal_orchestrator import SignalOrchestrator
 from src.snapshot_engine import SnapshotEngine
 
@@ -98,6 +99,37 @@ def _build_direct_executor_from_env() -> MT5DirectExecutor | None:
     return executor
 
 
+async def _get_account_state(dispatcher: MCPDispatcher, direct_executor: MT5DirectExecutor | None, user_id: str) -> AccountState:
+    """Intenta el camino MCP (mcp_dispatcher, via subproceso externo); si no
+    esta disponible (subproceso no instalado, no conecto, etc.) cae a
+    MT5DirectExecutor.get_account_info(), que ya tiene su propia conexion
+    directa al terminal MT5 y no depende de nada externo.
+
+    equity_start_of_day es una aproximacion (= balance actual) en el camino
+    directo -- MT5 account_info() no expone la equity de apertura del dia;
+    el camino MCP real (get_account_state) si la deriva de history_deals_get.
+    """
+    try:
+        return await dispatcher.get_account_state(user_id)
+    except Exception as exc:
+        if direct_executor is None:
+            raise
+        logger.debug("mcp_account_state_fallback_to_direct", error=str(exc))
+        info = direct_executor.get_account_info()
+        if info is None:
+            raise RuntimeError("MT5DirectExecutor.get_account_info() devolvio None (sin conexion)") from exc
+        positions = direct_executor.get_positions()
+        return AccountState(
+            equity=info["equity"],
+            equity_start_of_day=info["balance"],
+            open_positions=len(positions),
+            user_id=user_id,
+            balance=info["balance"],
+            free_margin=info["free_margin"],
+            margin_level=info.get("margin_level"),
+        )
+
+
 def build_default_orchestrator(symbol: str = "BTCUSDT", user_id: str = "default") -> tuple[SignalOrchestrator, SnapshotEngine, MCPDispatcher]:
     engine = SnapshotEngine(symbol=symbol)
 
@@ -119,7 +151,7 @@ def build_default_orchestrator(symbol: str = "BTCUSDT", user_id: str = "default"
         router=router,
         risk_engine=risk_engine,
         dispatcher=dispatcher,
-        account_state_provider=lambda: dispatcher.get_account_state(user_id),
+        account_state_provider=lambda: _get_account_state(dispatcher, direct_executor, user_id),
         emit=lambda event_type, data: manager.broadcast(user_id, event_type, data),
         build_router_context=build_router_context,
         user_id=user_id,
@@ -140,7 +172,7 @@ async def run_market_loop(
                 continue
             if engine.htf_listo():
                 try:
-                    equity = (await dispatcher.get_account_state(user_id)).equity
+                    equity = (await _get_account_state(dispatcher, orchestrator.direct_executor, user_id)).equity
                 except Exception as exc:
                     logger.warning("account_state_unavailable", error=str(exc))
                     await asyncio.sleep(interval_s)
@@ -161,8 +193,13 @@ async def main() -> None:
     try:
         await dispatcher.connect(user_id)
     except (Exception, asyncio.CancelledError) as exc:
-        logger.error("mcp_connect_failed", user_id=user_id, error=str(exc))
-        raise
+        if orchestrator.direct_executor is None:
+            logger.error("mcp_connect_failed", user_id=user_id, error=str(exc))
+            raise
+        logger.warning(
+            "mcp_connect_failed_using_direct_fallback", user_id=user_id, error=str(exc),
+            note="mcp_dispatcher (subproceso externo) no disponible -- se sigue con MT5DirectExecutor para lecturas y ordenes",
+        )
 
     port = int(os.environ.get("UNIFIED_BRAIN_PORT", "8001"))
     server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info"))

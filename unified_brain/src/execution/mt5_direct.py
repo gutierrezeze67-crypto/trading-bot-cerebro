@@ -365,6 +365,7 @@ class MT5DirectExecutor:
             "balance": info.balance, "equity": info.equity, "margin": info.margin,
             "free_margin": info.margin_free, "profit": info.profit,
             "currency": info.currency, "server": info.server, "login": info.login,
+            "margin_level": info.margin_level,
         }
 
     def get_positions(self) -> list[Any]:
