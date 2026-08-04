@@ -170,6 +170,9 @@ class SignalOrchestrator:
             "max_daily_loss_pct": risk_config.max_daily_loss_pct,
             "free_margin": account.free_margin,
             "margin_level": account.margin_level,
+            "balance": account.balance,
+            "equity": account.equity,
+            "equity_start_of_day": account.equity_start_of_day,
         }
 
     async def process_market_tick(self, snapshot: MarketSnapshot) -> None:
