@@ -39,15 +39,29 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from collections import defaultdict, deque
 from typing import Any
 
 import structlog
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 logger = structlog.get_logger(__name__)
+
+# Herramienta de uso personal -- ningun endpoint de datos/comandos debe ser
+# alcanzable sin esta clave (BACKEND_API_KEY en unified_brain/.env). Falla al
+# arrancar si no esta seteada: mejor un crash explicito en el arranque que un
+# servidor sirviendo balance/comandos reales sin ninguna proteccion.
+BACKEND_API_KEY = os.environ.get("BACKEND_API_KEY")
+if not BACKEND_API_KEY:
+    raise RuntimeError("Falta BACKEND_API_KEY en el entorno -- ver unified_brain/.env")
+
+
+def require_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> None:
+    if x_api_key != BACKEND_API_KEY:
+        raise HTTPException(status_code=401, detail="API key invalida o faltante")
 
 MAX_TRADE_HISTORY = 200
 RISK_OVERRIDE_KEYS = {
@@ -139,6 +153,11 @@ async def health() -> dict[str, str]:
 
 @app.websocket("/ws/{user_id}")
 async def ws_trading(websocket: WebSocket, user_id: str) -> None:
+    # WS del navegador no puede mandar headers custom -- la clave viaja como
+    # query param (?api_key=...). Se rechaza ANTES de aceptar la conexion.
+    if websocket.query_params.get("api_key") != BACKEND_API_KEY:
+        await websocket.close(code=4401)
+        return
     await manager.connect(user_id, websocket)
     try:
         while True:
@@ -201,7 +220,7 @@ async def _handle_command(user_id: str, msg: dict[str, Any]) -> dict[str, Any]:
 # ----------------------------------------------------------------------
 
 
-@app.get("/api/state/{user_id}")
+@app.get("/api/state/{user_id}", dependencies=[Depends(require_api_key)])
 async def get_state(user_id: str) -> dict[str, Any]:
     risk = manager.get_latest_risk(user_id)
     if risk is None:
@@ -211,13 +230,13 @@ async def get_state(user_id: str) -> dict[str, Any]:
     return {**risk, "paused": manager.is_paused(user_id)}
 
 
-@app.get("/api/history/{user_id}")
+@app.get("/api/history/{user_id}", dependencies=[Depends(require_api_key)])
 async def get_history(user_id: str, limit: int = 50) -> dict[str, Any]:
     trades = manager.get_trade_history(user_id, limit)
     return {"trades": trades, "limit": limit, "total": len(trades)}
 
 
-@app.get("/api/advisor/{user_id}")
+@app.get("/api/advisor/{user_id}", dependencies=[Depends(require_api_key)])
 async def get_advisor(user_id: str) -> dict[str, Any]:
     advisor = manager.get_latest_advisor(user_id)
     if advisor is None:
@@ -233,13 +252,13 @@ class CommandPayload(BaseModel):
     maxDD: float | None = Field(default=None, gt=0, le=1)
 
 
-@app.post("/api/command/{user_id}")
+@app.post("/api/command/{user_id}", dependencies=[Depends(require_api_key)])
 async def send_command(user_id: str, payload: CommandPayload) -> dict[str, Any]:
     result = await _handle_command(user_id, payload.model_dump(exclude_none=True))
     return result
 
 
-@app.get("/api/config/{user_id}")
+@app.get("/api/config/{user_id}", dependencies=[Depends(require_api_key)])
 async def get_config(user_id: str) -> dict[str, Any]:
     risk = manager.get_latest_risk(user_id) or {}
     overrides = manager.get_risk_overrides(user_id)
