@@ -43,6 +43,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -238,6 +239,26 @@ class MT5DirectExecutor:
             self._connected = False
             return False
 
+    @staticmethod
+    def _normalize_volume(volume: float, symbol_info: Any) -> float:
+        """MT5 rechaza (retcode 10014, 'Invalid volume') cualquier volumen
+        que no sea multiplo exacto de volume_step del simbolo, o que caiga
+        fuera de [volume_min, volume_max]. risk_engine.py calcula un float
+        "crudo" (ej. 1.7387675615523857 = risk_cash / sl_distance) que
+        nunca se redondeaba antes de mandarse a la orden real -- bloqueo
+        real confirmado en produccion (26 señales de swing seguidas
+        rechazadas asi durante una semana, ver logs de execution_failed).
+        El redondeo tiene que pasar aca, en el unico punto por el que pasa
+        CUALQUIER orden, no en risk_engine.py (que no conoce ni deberia
+        conocer las reglas de volumen del broker/simbolo)."""
+        step = symbol_info.volume_step or 0.01
+        normalized = round(volume / step) * step
+        normalized = max(symbol_info.volume_min, min(symbol_info.volume_max, normalized))
+        # Redondeo final a los decimales reales del step -- evita basura de
+        # punto flotante tipo 1.7400000000000002 que igual podria rebotar.
+        decimals = max(0, -Decimal(str(step)).as_tuple().exponent)
+        return round(normalized, decimals)
+
     def execute_order(
         self, symbol: str | None = None, side: str = "BUY", volume: float = 0.01,
         sl: float = 0, tp: float = 0, comment: str = "", deviation: int | None = None,
@@ -250,6 +271,13 @@ class MT5DirectExecutor:
             tick = mt5.symbol_info_tick(symbol)
             if not tick:
                 return OrderResult(success=False, error=f"No se obtuvo tick para {symbol}")
+
+            symbol_info = mt5.symbol_info(symbol)
+            if not symbol_info:
+                return OrderResult(success=False, error=f"No se obtuvo symbol_info para {symbol}")
+            volume = self._normalize_volume(volume, symbol_info)
+            if volume <= 0:
+                return OrderResult(success=False, error=f"Volumen normalizado invalido ({volume}) para {symbol}")
 
             side_upper = side.upper()
             if side_upper == "BUY":
