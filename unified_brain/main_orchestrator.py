@@ -186,6 +186,32 @@ async def run_market_loop(
         await engine.stop()
 
 
+async def reconcile_trade_status_loop(direct_executor: MT5DirectExecutor | None, user_id: str, interval_s: float = 30.0) -> None:
+    """signal_orchestrator.py emite trade_executed con status='OPEN'/pnl=None
+    fijo a proposito (no hace polling, ver comentario ahi) -- sin esto
+    /api/history miente para siempre que un trade sigue abierto aunque ya
+    haya cerrado por SL/TP hace dias. Este loop background confirma contra
+    MT5 real cada trade que el historial en memoria todavia marca OPEN, y
+    corrige status/pnl con update_trade_status() cuando corresponde.
+
+    Solo lee (positions_get/history_deals_get via get_position_status) -- no
+    manda ninguna orden, no puede afectar la operativa real."""
+    if direct_executor is None:
+        logger.info("reconcile_trade_status_disabled", reason="direct_executor no configurado (MT5_DIRECT_EXECUTION!=true)")
+        return
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            for ticket in manager.get_open_tickets(user_id):
+                result = await asyncio.to_thread(direct_executor.get_position_status, ticket)
+                if result["status"] != "UNKNOWN":
+                    updated = manager.update_trade_status(user_id, ticket, result["status"], result["pnl"])
+                    if updated and result["status"] == "CLOSED":
+                        logger.info("trade_status_reconciled", ticket=ticket, pnl=result["pnl"])
+        except Exception as exc:  # noqa: BLE001 - un ciclo roto no puede tirar el loop entero
+            logger.warning("reconcile_trade_status_failed", error=str(exc))
+
+
 async def main() -> None:
     user_id = os.environ.get("UNIFIED_BRAIN_USER_ID", "default")
     orchestrator, engine, dispatcher = build_default_orchestrator(symbol=os.environ.get("UNIFIED_BRAIN_SYMBOL", "BTCUSDT"), user_id=user_id)
@@ -207,6 +233,7 @@ async def main() -> None:
     try:
         await asyncio.gather(
             run_market_loop(engine, orchestrator, dispatcher, user_id),
+            reconcile_trade_status_loop(orchestrator.direct_executor, user_id),
             server.serve(),
         )
     finally:

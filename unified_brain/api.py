@@ -122,6 +122,24 @@ class ConnectionManager:
     def get_trade_history(self, user_id: str, limit: int) -> list[dict[str, Any]]:
         return list(self._trade_history.get(user_id, ()))[:limit]
 
+    def get_open_tickets(self, user_id: str) -> list[int]:
+        return [t["ticket"] for t in self._trade_history.get(user_id, ()) if t.get("status") == "OPEN" and t.get("ticket")]
+
+    def update_trade_status(self, user_id: str, ticket: int, status: str, pnl: float | None) -> bool:
+        """Muta en el lugar la entrada del deque que matchea `ticket` -- ver
+        reconcile_trade_status_loop() en main_orchestrator.py, que es quien
+        llama esto tras confirmar contra MT5 real si el trade sigue abierto o
+        ya cerro. signal_orchestrator.py nunca actualiza esto al emitir
+        trade_executed (status queda 'OPEN' fijo a proposito, ver comentario
+        ahi) -- este es el unico lugar que lo corrige despues, con datos
+        reales del broker en vez de inventados."""
+        for trade in self._trade_history.get(user_id, ()):
+            if trade.get("ticket") == ticket:
+                trade["status"] = status
+                trade["pnl"] = pnl
+                return True
+        return False
+
     def is_paused(self, user_id: str) -> bool:
         return self._paused[user_id]
 

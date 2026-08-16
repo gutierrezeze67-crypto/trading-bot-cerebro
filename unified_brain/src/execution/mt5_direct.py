@@ -402,6 +402,37 @@ class MT5DirectExecutor:
         positions = mt5.positions_get()
         return list(positions) if positions else []
 
+    def get_position_status(self, ticket: int) -> dict[str, Any]:
+        """Estado real de un trade por ticket -- lo que signal_orchestrator.py
+        NO hace al emitir trade_executed (queda status='OPEN'/pnl=None fijo,
+        ver comentario ahi). positions_get(ticket=...) usa la misma convencion
+        que close_position() de este archivo: el ticket que devuelve
+        order_send() identifica tambien la posicion resultante.
+
+        Si la posicion sigue en positions_get, sigue abierta -> pnl flotante
+        (pos.profit, sin swap/comision todavia). Si no aparece, se asume
+        cerrada (SL/TP/cierre manual) y el pnl real sale de sumar profit+swap+
+        commission de TODOS los deals de esa posicion en el historial (entry +
+        exit -- history_deals_get(position=...) no necesita history_select
+        previo, filtra por position id directo)."""
+        if not self.is_connected():
+            return {"status": "UNKNOWN", "pnl": None}
+        try:
+            positions = mt5.positions_get(ticket=ticket)
+            if positions:
+                return {"status": "OPEN", "pnl": round(positions[0].profit, 2)}
+
+            deals = mt5.history_deals_get(position=ticket)
+            if not deals:
+                # Ni abierta ni en historial -- MT5 puede tardar en indexar el
+                # cierre recien hecho, o el ticket no es de este login.
+                return {"status": "UNKNOWN", "pnl": None}
+            total_pnl = sum(d.profit + d.swap + d.commission for d in deals)
+            return {"status": "CLOSED", "pnl": round(total_pnl, 2)}
+        except Exception as exc:  # noqa: BLE001
+            logger.error("mt5_direct_position_status_error", ticket=ticket, error=str(exc))
+            return {"status": "UNKNOWN", "pnl": None}
+
     def disconnect(self) -> None:
         try:
             mt5.shutdown()
