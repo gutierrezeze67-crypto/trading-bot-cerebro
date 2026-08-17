@@ -48,6 +48,15 @@ MAX_KLINES_1M = 250  # suficiente para resamplear ~80 velas de 3m
 HTF_RECALC_SECONDS = 300
 IMBALANCE_RATIO = c.IMBALANCE_RATIO
 
+# Historia de ATR%/precio para el filtro de compresion de HTFFundingBrain
+# (ver atr_compression_percentile en brain_htf_funding.HTFParams, mismo
+# criterio y misma constante que backtest_htf.ATR_RANK_LOOKBACK_BARS -- 30
+# dias de velas 15m). Deque separado y liviano (solo floats, no OHLCV
+# completo) para no tener que agrandar _candles_15m, que ya cumple su rol
+# con maxlen=500.
+ATR_RANK_LOOKBACK_BARS = 2880
+ATR_RANK_MIN_PERIODS = ATR_RANK_LOOKBACK_BARS // 4
+
 # Para brain_htf_funding.HTFFundingBrain.decide(), que necesita atr14_15m y
 # vwap_15m en PRECIO directo (no en ticks, a diferencia de atr_30m -- ver
 # _recompute_atr_30m). No hay equivalentes en config/constants.py (ese
@@ -111,7 +120,7 @@ class SnapshotEngine:
             "poc": 0.0, "vah": 0.0, "val": 0.0, "cvd_trend": "FLAT",
             "naked_pocs": [], "liq_clusters": {"bids": [], "asks": []},
             "atr_30m": 200.0, "swing_high_h4": None, "swing_low_h4": None,
-            "atr14_15m": None, "vwap_15m": None,
+            "atr14_15m": None, "vwap_15m": None, "atr_rank_30d": None,
         }
 
         # Filtros institucionales: velas M30/H4 agregadas desde las 1m ya
@@ -132,6 +141,10 @@ class SnapshotEngine:
         # "ATR invalido" y no dispara).
         self._candles_15m: deque = deque(maxlen=500)
         self._m15_buffer: list = []
+        # Historia de ATR%/precio por vela 15m cerrada, para atr_rank_30d
+        # (ver _recompute_atr14_15m) -- separado de _candles_15m, que no
+        # necesita 30 dias de OHLCV completo para ATR14/VWAP20.
+        self._atr_pct_15m_history: deque = deque(maxlen=ATR_RANK_LOOKBACK_BARS)
 
         # Agregador dedicado a SenseiZoneGenerator (15m/1h/4h/1D), alineado a
         # bordes REALES de reloj UTC (:00/:15/:30/:45 para 15m, etc.) -- a
@@ -835,6 +848,7 @@ class SnapshotEngine:
             "swing_low_h4": self._htf_cache.get("swing_low_h4"),
             "atr14_15m": self._htf_cache.get("atr14_15m"),
             "vwap_15m": self._htf_cache.get("vwap_15m"),
+            "atr_rank_30d": self._htf_cache.get("atr_rank_30d"),
         }
         logger.info(f"📊 HTF recalculado: POC={vp['poc']} VAH={vp['vah']} VAL={vp['val']}")
 
@@ -912,7 +926,24 @@ class SnapshotEngine:
         prev_closes[0] = closes[0]
 
         tr = np.maximum(highs - lows, np.maximum(np.abs(highs - prev_closes), np.abs(lows - prev_closes)))
-        self._htf_cache["atr14_15m"] = float(np.mean(tr))
+        atr14_15m = float(np.mean(tr))
+        self._htf_cache["atr14_15m"] = atr14_15m
+
+        # atr_rank_30d: percentil del ATR%/precio ACTUAL contra su propia
+        # historia de hasta ATR_RANK_LOOKBACK_BARS velas 15m (ver
+        # atr_compression_percentile en brain_htf_funding.HTFParams). Se
+        # guarda ANTES de agregar el valor actual (percentil "hasta ayer",
+        # nunca se compara contra si mismo) -- mismo criterio zero-look-ahead
+        # que el resto del HTF, adaptado a un buffer incremental en vez de
+        # pandas.rolling().
+        atr_pct = atr14_15m / closes[-1] if closes[-1] > 0 else None
+        if atr_pct is not None:
+            historia = self._atr_pct_15m_history
+            if len(historia) >= ATR_RANK_MIN_PERIODS:
+                self._htf_cache["atr_rank_30d"] = sum(v <= atr_pct for v in historia) / len(historia)
+            else:
+                self._htf_cache["atr_rank_30d"] = None
+            historia.append(atr_pct)
 
     def _recompute_vwap_15m(self) -> None:
         """VWAP rolling sobre las ultimas VWAP_15M_LOOKBACK_BARS velas M15

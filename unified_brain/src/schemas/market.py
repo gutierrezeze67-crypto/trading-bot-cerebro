@@ -124,6 +124,7 @@ class MarketSnapshot(BaseModel):
             "swing_h4_l": htf_cache.get("swing_low_h4"),
             "atr14_15m": htf_cache.get("atr14_15m"),
             "vwap_15m": htf_cache.get("vwap_15m"),
+            "atr_rank_30d": htf_cache.get("atr_rank_30d"),
         }
 
         ts_ms = ultima.get("_open_time")

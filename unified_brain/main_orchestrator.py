@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 # al entorno del proceso.
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
+from config.assets import apply_cost_overlay, get_asset_config
 from src.execution.mcp_dispatcher import MCPDispatcher, MCPDispatcherConfig, MCPTransport
 from src.execution.mt5_direct import MT5DirectExecutor
 from src.experts.scalping_expert import ScalpingExpert
@@ -136,7 +137,24 @@ def build_default_orchestrator(symbol: str = "BTCUSDT", user_id: str = "default"
     risk_manager = RiskManager(firestore_client=None, capital_inicial=50_000.0)
 
     scalping_expert = ScalpingExpert(risk_manager=risk_manager)
-    swing_expert = SwingExpert()
+
+    # HTFFundingBrain.decide() filtra señales por costo neto (min_rr_net,
+    # ver HTFParams) -- sin esto SIEMPRE usaba el ASSET_CONFIG base
+    # (config/assets.py), el mas barato posible (perfil institucional
+    # Binance Futures), sin importar en que cuenta ejecutaba de verdad.
+    # UNIFIED_BRAIN_COST_MODEL default FUNDEDNEXT_PROP a proposito: no es
+    # solo "el costo real de Vantage" (la cuenta demo de hoy), es el costo
+    # del tipo de cuenta al que esta plataforma apunta (fondeo). Validado
+    # 2026-08-16: con este filtro mas estricto, la ventana mala de ago 2026
+    # (34 trades/PF 1.31 con el perfil barato) se reduce a 2 trades, sin
+    # empeorar el resultado del periodo completo -- actua como filtro de
+    # calidad de señal, no solo de contabilidad de PnL. Cambiar via env var
+    # si esta cuenta pasa a operar con costos de otro perfil (ver
+    # config.assets.BROKER_COST_OVERLAYS para las opciones disponibles).
+    cost_model = os.environ.get("UNIFIED_BRAIN_COST_MODEL", "FUNDEDNEXT_PROP")
+    swing_asset_cfg = apply_cost_overlay(get_asset_config("BTCUSDT"), cost_model)
+    logger.info("swing_cost_model", cost_model=cost_model, spread_bps=swing_asset_cfg.get("spread_bps"))
+    swing_expert = SwingExpert(asset_cfg=swing_asset_cfg)
     router = DeterministicRouter()
     risk_engine = RiskEngine()
 
