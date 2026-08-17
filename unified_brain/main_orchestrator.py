@@ -16,7 +16,6 @@ from dotenv import load_dotenv
 # al entorno del proceso.
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-from config.assets import apply_cost_overlay, get_asset_config
 from src.execution.mcp_dispatcher import MCPDispatcher, MCPDispatcherConfig, MCPTransport
 from src.execution.mt5_direct import MT5DirectExecutor
 from src.experts.scalping_expert import ScalpingExpert
@@ -28,6 +27,12 @@ from src.schemas.market import MarketSnapshot
 from src.schemas.risk import AccountState
 from src.services.signal_orchestrator import SignalOrchestrator
 from src.snapshot_engine import SnapshotEngine
+
+# Import de 'config' DESPUES del primer 'from src...' a proposito: recien
+# ese import dispara unified_brain/src/__init__.py, que agrega la raiz del
+# repo a sys.path (ahi vive config/, hermano de unified_brain/) -- antes de
+# eso 'config' no es importable (ModuleNotFoundError), confirmado en vivo.
+from config.assets import apply_cost_overlay, get_asset_config
 
 from api import app, manager
 
