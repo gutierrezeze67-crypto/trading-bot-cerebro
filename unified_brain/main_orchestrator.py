@@ -121,10 +121,19 @@ async def _get_account_state(dispatcher: MCPDispatcher, direct_executor: MT5Dire
         if direct_executor is None:
             raise
         logger.debug("mcp_account_state_fallback_to_direct", error=str(exc))
-        info = direct_executor.get_account_info()
+        # get_account_info()/get_positions() son llamadas MT5 sincronicas y
+        # bloqueantes (mismo motivo que mt5_direct.py exige to_thread para
+        # execute_order/close_position, ver docstring ahi) -- este camino
+        # corre cada 5s desde run_market_loop, asi que llamarlas directo
+        # bloquea el event loop ENTERO (API REST/WS incluida) cada vez que
+        # MT5 tarda un poco de mas en responder (confirmado en vivo
+        # 2026-08-24: una segunda conexion IPC concurrente hizo que
+        # /api/state y el resto quedaran colgados varios minutos mientras
+        # /health -- que no toca MT5 -- seguia respondiendo).
+        info = await asyncio.to_thread(direct_executor.get_account_info)
         if info is None:
             raise RuntimeError("MT5DirectExecutor.get_account_info() devolvio None (sin conexion)") from exc
-        positions = direct_executor.get_positions()
+        positions = await asyncio.to_thread(direct_executor.get_positions)
         return AccountState(
             equity=info["equity"],
             equity_start_of_day=info["balance"],
