@@ -38,8 +38,16 @@ class HTFParams:
     sl_atr_mult: float = 1.2
     tp1_atr_mult: float = 2.5   # fallback si no hay zona HTF real en la dirección (ver _calc_structural_tps)
     tp2_atr_mult: float = 5.0
-    tp1_atr_cap_mult: float = 3.0   # tope: aunque la zona real esté más lejos, no perseguir más de esto
-    tp2_atr_cap_mult: float = 6.0
+    # Tope: aunque la zona HTF real esté más lejos, no perseguir más de
+    # tp_atr_cap_mult x ATR -- 24/8/2026: 3.0/6.0 (valor original) probado
+    # contra datos reales del rally BTC 64k->79k (14-24 ago 2026): cortaba
+    # la ganancia demasiado pronto en tendencia fuerte (PF 0.15 esa ventana,
+    # perdiendo). Subido a 4.0/8.0 -- mejora el periodo completo (PF 2.86->
+    # 3.25 sobre 7 meses) Y arregla el rally (PF 0.15->4.72) sin disparar
+    # el DD (6.08%->6.66%). 5.0/10.0 no suma mas y sube el DD a 7.36% --
+    # 4.0/8.0 es el punto valido, no el extremo.
+    tp1_atr_cap_mult: float = 4.0
+    tp2_atr_cap_mult: float = 8.0
     tp1_size_pct: float = 0.6
     be_trigger_atr_mult: float = 0.5
     be_buffer_atr_mult: float = 0.2
