@@ -259,6 +259,13 @@ class HTFFundingBrain:
             asset_cfg = get_asset_config("BTCUSDT")
         self.asset_cfg = asset_cfg
         self._zone_cooldowns: dict = {}  # "POC_64000" -> ts_expiry_ms
+        # Motivo del ultimo decide() que no genero señal (o "OK" si genero
+        # una) -- decide() sigue devolviendo Optional[dict] sin cambios (no
+        # romper la firma que ya usan los backtests), esto es un canal
+        # aparte solo para diagnostico. Ver signal_orchestrator.py, que lo
+        # lee via swing_expert.brain.last_reject_reason cuando swing_signal
+        # es None, para no perder el detalle de "por que" en el advisor.
+        self.last_reject_reason: str = "SIN_EVALUAR"
 
     def _zona_valida(self, precio: float, htf: dict, ts_ms: int) -> tuple:
         """Devuelve (en_zona, tipo_zona, motivo). Chequea proximidad Y
@@ -308,23 +315,28 @@ class HTFFundingBrain:
         atr14_15m/atr_rank_30d (ver atr_compression_percentile en HTFParams)."""
         atr_rank_30d = htf.get("atr_rank_30d")
         if atr_rank_30d is not None and atr_rank_30d < self.params.atr_compression_percentile:
+            self.last_reject_reason = f"ATR_COMPRIMIDO (percentil {atr_rank_30d:.2f} < {self.params.atr_compression_percentile})"
             return None
 
         setup, direccion, prioridad = prioridad_setup(vela, htf, self.params)
         if setup is None:
+            self.last_reject_reason = "SIN_PATRON"
             return None
 
         conviction = _PRIORIDAD_CONVICTION.get(prioridad, 6)
         if conviction < self.params.min_conviction:
+            self.last_reject_reason = f"CONVICCION_BAJA ({conviction}<{self.params.min_conviction})"
             return None
 
         precio = vela["close"]
         valido, motivo = self.validate_htf(direccion, precio, htf, ts_ms, conviction)
         if not valido:
+            self.last_reject_reason = motivo
             return None
 
         atr = htf.get("atr14_15m")
         if not atr or atr <= 0:
+            self.last_reject_reason = "ATR_INVALIDO"
             return None
 
         entry = precio
@@ -346,19 +358,23 @@ class HTFFundingBrain:
         # tiene que seguir siendo atractivo - ver HTFParams.
         min_tp1_dist = entry_net * (self.params.min_tp1_spread_mult * self.asset_cfg["spread_bps"] / 10000)
         if abs(tp1_net - entry_net) < min_tp1_dist:
+            self.last_reject_reason = "TP1_MUY_CERCA_DEL_SPREAD"
             return None
 
         riesgo_net = abs(entry_net - sl_net)
         if riesgo_net <= 0:
+            self.last_reject_reason = "RIESGO_INVALIDO"
             return None
         rr_net = abs(tp1_net - entry_net) / riesgo_net
         if rr_net < self.params.min_rr_net:
+            self.last_reject_reason = f"RR_NETO_BAJO ({rr_net:.2f}<{self.params.min_rr_net})"
             return None
 
         htf_boost = 2 if (htf.get("cvd_trend") in ("UP", "DOWN") and (
             (direccion == "LONG" and htf["cvd_trend"] == "UP") or (direccion == "SHORT" and htf["cvd_trend"] == "DOWN")
         )) else 0
 
+        self.last_reject_reason = "OK"
         return {
             "decision": direccion,
             "setup_type": setup,

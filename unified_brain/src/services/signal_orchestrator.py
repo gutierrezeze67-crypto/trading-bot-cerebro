@@ -205,8 +205,20 @@ class SignalOrchestrator:
             decision = self.router.route(account, scalp_signal, swing_signal, context)
 
             if decision.action == "hold":
-                log.info("router_hold", reason=decision.hold_reason, detail=decision.detail)
-                await self.emit("advisor_update", {"text": decision.detail, "reasoning": decision.detail, "type": "hold", "pattern": None, "hold_reason": decision.hold_reason})
+                detail = decision.detail
+                if decision.hold_reason == "NO_PATTERN":
+                    # decision.detail es siempre el generico "ningun experto
+                    # encontro setup" -- swing_expert.brain.last_reject_reason
+                    # (canal de diagnostico aparte, ver brain_htf_funding.py)
+                    # tiene el motivo real (compresion de ATR, sin patron,
+                    # cooldown de zona, RR neto bajo, etc). getattr con
+                    # default None: ScalpingExpert no tiene atributo .brain,
+                    # no puede romper si algun dia vuelve a estar activo.
+                    swing_reason = getattr(getattr(self.swing_expert, "brain", None), "last_reject_reason", None)
+                    if swing_reason and swing_reason not in ("OK", "SIN_EVALUAR"):
+                        detail = f"{decision.detail} (swing: {swing_reason})"
+                log.info("router_hold", reason=decision.hold_reason, detail=detail)
+                await self.emit("advisor_update", {"text": detail, "reasoning": detail, "type": "hold", "pattern": None, "hold_reason": decision.hold_reason})
                 await self.emit("risk_update", self._risk_update_payload(account, risk_config, status="OK"))
                 return
 
