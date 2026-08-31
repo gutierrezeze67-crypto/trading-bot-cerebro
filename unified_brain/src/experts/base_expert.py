@@ -16,3 +16,13 @@ class BaseExpert(ABC):
         """None significa 'no hay setup para mi estilo', no 'no operar' -- esa
         decision es del router (deterministic_router.py), no del experto."""
         raise NotImplementedError
+
+
+class NullExpert(BaseExpert):
+    """Siempre devuelve None -- usado para desactivar uno de los dos
+    expertos (ej: correr solo scalping en una cuenta chica donde swing
+    todavia no esta validado) sin tocar SignalOrchestrator, que requiere
+    ambos expertos no-None en su constructor."""
+
+    def analyze(self, snapshot: MarketSnapshot) -> UnifiedSignal | None:
+        return None

@@ -18,13 +18,14 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from src.execution.mcp_dispatcher import MCPDispatcher, MCPDispatcherConfig, MCPTransport
 from src.execution.mt5_direct import MT5DirectExecutor
+from src.experts.base_expert import NullExpert
 from src.experts.scalping_expert import ScalpingExpert
 from src.experts.swing_expert import SwingExpert
 from src.risk.risk_engine import RiskEngine
 from src.risk.risk_manager import RiskManager
 from src.router.deterministic_router import DeterministicRouter, RouterContext
 from src.schemas.market import MarketSnapshot
-from src.schemas.risk import AccountState
+from src.schemas.risk import AccountState, RiskConfig
 from src.services.signal_orchestrator import SignalOrchestrator
 from src.snapshot_engine import SnapshotEngine
 
@@ -148,7 +149,19 @@ async def _get_account_state(dispatcher: MCPDispatcher, direct_executor: MT5Dire
 def build_default_orchestrator(symbol: str = "BTCUSDT", user_id: str = "default") -> tuple[SignalOrchestrator, SnapshotEngine, MCPDispatcher]:
     engine = SnapshotEngine(symbol=symbol)
 
-    risk_manager = RiskManager(firestore_client=None, capital_inicial=50_000.0)
+    # Capital real de la cuenta que ejecuta -- antes hardcodeado a 50_000.0
+    # (valor de backtest/demo). Con una cuenta chica real (ej. $200 Exness
+    # Zero) esto es crítico: RiskManager._es_equity_absurdo() usa
+    # capital_inicial como referencia para el sanity-check de equity que
+    # decide() consulta via get_equity_state() para el daily-loss-limit
+    # (config.constants.DAILY_LOSS_LIMIT, 2.5%) -- si esto se deja en 50_000
+    # con una cuenta de 200, el equity real ($200) cae fuera de la banda
+    # sana (capital_inicial*0.1 a *10 = 5_000-500_000) y el sistema lo
+    # trata como corrupto, reseteando el tracking de perdida diaria a
+    # $50_000 en vez de $200. Env var nueva, default preserva el
+    # comportamiento previo (deployment swing/demo actual).
+    capital_inicial = float(os.environ.get("UNIFIED_BRAIN_CAPITAL_INICIAL", "50000"))
+    risk_manager = RiskManager(firestore_client=None, capital_inicial=capital_inicial)
 
     scalping_expert = ScalpingExpert(risk_manager=risk_manager)
 
@@ -165,12 +178,48 @@ def build_default_orchestrator(symbol: str = "BTCUSDT", user_id: str = "default"
     # calidad de señal, no solo de contabilidad de PnL. Cambiar via env var
     # si esta cuenta pasa a operar con costos de otro perfil (ver
     # config.assets.BROKER_COST_OVERLAYS para las opciones disponibles).
-    cost_model = os.environ.get("UNIFIED_BRAIN_COST_MODEL", "FUNDEDNEXT_PROP")
-    swing_asset_cfg = apply_cost_overlay(get_asset_config("BTCUSDT"), cost_model)
-    logger.info("swing_cost_model", cost_model=cost_model, spread_bps=swing_asset_cfg.get("spread_bps"))
-    swing_expert = SwingExpert(asset_cfg=swing_asset_cfg)
+    # Swing (HTFFundingBrain) desactivable por deployment: el ultimo estado
+    # conocido (ver memoria de proyecto) es una investigacion ABIERTA sobre
+    # una caida de PF en ventana live (3.00 backtest OOS vs 1.29 reconstruido
+    # en vivo, no resuelta) -- no arrancar swing por default en una cuenta
+    # chica real hasta que ese gap este resuelto. UNIFIED_BRAIN_ENABLE_SWING=
+    # true lo reactiva sin tocar codigo.
+    enable_swing = os.environ.get("UNIFIED_BRAIN_ENABLE_SWING", "true").lower() == "true"
+    if enable_swing:
+        cost_model = os.environ.get("UNIFIED_BRAIN_COST_MODEL", "FUNDEDNEXT_PROP")
+        swing_asset_cfg = apply_cost_overlay(get_asset_config("BTCUSDT"), cost_model)
+        logger.info("swing_cost_model", cost_model=cost_model, spread_bps=swing_asset_cfg.get("spread_bps"))
+        swing_expert = SwingExpert(asset_cfg=swing_asset_cfg)
+    else:
+        logger.info("swing_expert_disabled", reason="UNIFIED_BRAIN_ENABLE_SWING=false")
+        swing_expert = NullExpert()
     router = DeterministicRouter()
-    risk_engine = RiskEngine()
+    # Lote fijo (RISK_FIXED_LOT_OVERRIDE): pensado para cuentas chicas donde
+    # el risk_pct_per_trade default (0.5%) fuerza el lote minimo del broker
+    # de cualquier forma (ver sizing_capital_leverage.py) -- en vez de esa
+    # distorsion no controlada, se opera a un lote elegido a mano y se sube
+    # manualmente mes a mes. None (default) preserva el comportamiento
+    # existente (% de equity, deployment swing/demo actual).
+    fixed_lot_raw = os.environ.get("RISK_FIXED_LOT_OVERRIDE", "").strip()
+    risk_config = RiskConfig(
+        risk_pct_per_trade=float(os.environ.get("RISK_PCT_PER_TRADE", "0.005")),
+        max_daily_loss_pct=float(os.environ.get("RISK_MAX_DAILY_LOSS_PCT", "0.02")),
+        max_trades_per_day=int(os.environ.get("RISK_MAX_TRADES_PER_DAY", "5")),
+        max_concurrent_positions=int(os.environ.get("RISK_MAX_CONCURRENT_POSITIONS", "1")),
+        # Default 3.0 (300% notional/equity) esta calibrado para el modelo de
+        # % de riesgo (0.5-0.75%), no para un lote fijo elegido a mano en una
+        # cuenta chica: con apalancamiento real (~1:400 en BTCUSD Exness) un
+        # lote de 0.05-0.20 en $200-$800 de equity da ratios notional/equity
+        # de ~19-20x (margen real usado sigue siendo bajo, ~5-10% del
+        # equity -- el 300% default bloquearia esto SIEMPRE, no como error,
+        # sino porque el cap fue pensado para otro modo de sizing). Subir
+        # via env si se usa RISK_FIXED_LOT_OVERRIDE.
+        max_position_equity_pct=float(os.environ.get("RISK_MAX_POSITION_EQUITY_PCT", "3.0")),
+        fixed_lot_override=float(fixed_lot_raw) if fixed_lot_raw else None,
+    )
+    if risk_config.fixed_lot_override is not None:
+        logger.info("risk_fixed_lot_override_enabled", lot=risk_config.fixed_lot_override)
+    risk_engine = RiskEngine(config=risk_config)
 
     dispatcher = MCPDispatcher(_build_mcp_config_from_env())
     direct_executor = _build_direct_executor_from_env()

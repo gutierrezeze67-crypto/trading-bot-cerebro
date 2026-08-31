@@ -28,14 +28,18 @@ class RiskConfig(BaseModel):
     risk_pct_per_trade: float = Field(gt=0, le=1.0, default=0.005)
     max_position_equity_pct: float = Field(
         gt=0,
-        le=10.0,
+        le=50.0,
         default=3.0,
         description="Tope de exposicion nocional como multiplo de equity. Antes 0.95 (95%),"
         " pensado para spot sin apalancamiento (Binance). En una cuenta CFD con margen"
-        " (ej. Vantage) tener notional > equity es normal y seguro -- el limite real de"
-        " riesgo lo pone risk_pct_per_trade (perdida en SL), no el notional bruto. 3.0"
-        " es un tope generoso pero no infinito, para seguir cazando errores de calculo"
-        " reales (ej. una señal con sl_distance absurdamente chico).",
+        " (ej. Vantage, Exness) tener notional > equity es normal y seguro -- el limite real"
+        " de riesgo lo pone risk_pct_per_trade o fixed_lot_override (perdida en SL), no el"
+        " notional bruto. Tope subido de 10.0 a 50.0 (2026-08-31): con fixed_lot_override en"
+        " una cuenta chica real (ej. 0.05-0.20 BTC en $200-$800 con apalancamiento ~1:400 de"
+        " Exness BTCUSD) el ratio notional/equity real ronda 19-20x -- el limite viejo de 10x"
+        " bloqueaba esto SIEMPRE, no como error real. 50.0 sigue actuando como backstop"
+        " (cachea un bug tipo 'se mando 10x el lote querido'), simplemente calibrado al"
+        " apalancamiento real del broker en vez de a un supuesto de cuenta spot.",
     )
     contract_value_per_price_unit: float = Field(
         gt=0,
@@ -43,6 +47,18 @@ class RiskConfig(BaseModel):
         description="USDT de PnL por 1 unidad de precio de movimiento y 1 unidad de qty. "
         "Para BTCUSDT (ASSET_CONFIG: contract_size=1, tick_size=tick_value=0.10) el ratio es 1.0 "
         "-- mismo valor que usa HTFRiskManager.calc_size(entry, sl) = risk_usdt/dist.",
+    )
+    fixed_lot_override: float | None = Field(
+        gt=0,
+        default=None,
+        description="Si esta seteado, pre_flight() usa este lote FIJO en vez de "
+        "calcularlo desde risk_pct_per_trade*equity. Pensado para cuentas chicas "
+        "donde el % de riesgo del modelo (0.5-0.75%) fuerza el lote minimo del "
+        "broker de cualquier forma (ver sizing_capital_leverage.py) -- en vez de "
+        "esa distorsion no controlada, se opera a un lote fijo elegido a mano y "
+        "se sube manualmente mes a mes (0.05 -> 0.10 -> ...) a medida que la "
+        "cuenta crece. SIZE_ANOMALY sigue aplicando como backstop de seguridad "
+        "(notional vs max_position_equity_pct) aunque el lote sea fijo.",
     )
 
 

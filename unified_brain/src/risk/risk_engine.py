@@ -59,8 +59,15 @@ class RiskEngine:
             log.warning("risk_blocked", code=result.code, msg=result.msg)
             return result
 
-        risk_cash = account.equity * self.config.risk_pct_per_trade
-        adjusted_lot = risk_cash / (sl_distance * self.config.contract_value_per_price_unit)
+        if self.config.fixed_lot_override is not None:
+            # Lote fijo elegido a mano (ver RiskConfig.fixed_lot_override) en
+            # vez del % de riesgo -- risk_cash se recalcula igual, solo para
+            # logging/consistencia con el chequeo SIZE_ANOMALY de abajo.
+            adjusted_lot = self.config.fixed_lot_override
+            risk_cash = adjusted_lot * sl_distance * self.config.contract_value_per_price_unit
+        else:
+            risk_cash = account.equity * self.config.risk_pct_per_trade
+            adjusted_lot = risk_cash / (sl_distance * self.config.contract_value_per_price_unit)
 
         notional = adjusted_lot * signal.entry_price * self.config.contract_value_per_price_unit
         if notional > account.equity * self.config.max_position_equity_pct:
