@@ -40,11 +40,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from collections import defaultdict, deque
 from typing import Any
 
 import structlog
-from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -158,6 +159,25 @@ manager = ConnectionManager()
 app = FastAPI(title="Unified Brain Trading API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# Trackea si run_market_loop() esta consiguiendo el estado de cuenta real (MT5
+# conectado) o no -- antes /health devolvia "ok" fijo sin chequear nada, por lo
+# que un watchdog basado en /health nunca detectaba que MT5 se habia colgado
+# (confirmado en vivo 2026-08-31/09-09: 9 dias sin operar con /health="ok" todo
+# el tiempo). _account_state_health.last_ok_ts arranca en el momento del import
+# (no en 0) para no marcar "degraded" en el primer instante despues de un
+# restart, antes de que el loop tenga chance de correr una vez.
+_account_state_health: dict[str, float] = {"last_ok_ts": time.time(), "fail_streak": 0}
+ACCOUNT_STATE_STALE_S = 90  # ~18 ticks fallidos seguidos a interval_s=5
+
+
+def mark_account_state_ok() -> None:
+    _account_state_health["last_ok_ts"] = time.time()
+    _account_state_health["fail_streak"] = 0
+
+
+def mark_account_state_failed() -> None:
+    _account_state_health["fail_streak"] += 1
+
 
 @app.get("/")
 async def root() -> dict[str, str]:
@@ -165,8 +185,16 @@ async def root() -> dict[str, str]:
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+async def health(response: Response) -> dict[str, Any]:
+    stale_s = time.time() - _account_state_health["last_ok_ts"]
+    healthy = stale_s < ACCOUNT_STATE_STALE_S
+    if not healthy:
+        response.status_code = 503
+    return {
+        "status": "ok" if healthy else "degraded",
+        "account_state_stale_seconds": round(stale_s, 1),
+        "account_state_fail_streak": _account_state_health["fail_streak"],
+    }
 
 
 @app.websocket("/ws/{user_id}")

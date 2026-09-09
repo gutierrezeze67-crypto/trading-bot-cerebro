@@ -13,8 +13,12 @@ from dotenv import load_dotenv
 # Carga unified_brain/.env (MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, etc.) ANTES
 # de que nada mas abajo lea os.environ - sin esto, _build_mcp_config_from_env()
 # falla con "Faltan MT5_LOGIN..." aunque el .env exista, porque nunca se inyecta
-# al entorno del proceso.
-load_dotenv(Path(__file__).resolve().parent / ".env")
+# al entorno del proceso. Nombre de archivo configurable via
+# UNIFIED_BRAIN_ENV_FILE para poder correr un segundo proceso (ej. scalping)
+# desde la misma carpeta con su propio archivo de secretos, relanzable por
+# script sin depender de variables de entorno tipeadas a mano en una sesion
+# de PowerShell (esas se pierden si la sesion se cierra).
+load_dotenv(Path(__file__).resolve().parent / os.environ.get("UNIFIED_BRAIN_ENV_FILE", ".env"))
 
 from src.execution.mcp_dispatcher import MCPDispatcher, MCPDispatcherConfig, MCPTransport
 from src.execution.mt5_direct import MT5DirectExecutor
@@ -35,7 +39,7 @@ from src.snapshot_engine import SnapshotEngine
 # eso 'config' no es importable (ModuleNotFoundError), confirmado en vivo.
 from config.assets import apply_cost_overlay, get_asset_config
 
-from api import app, manager
+from api import app, manager, mark_account_state_failed, mark_account_state_ok
 
 logger = structlog.get_logger(__name__)
 
@@ -256,8 +260,10 @@ async def run_market_loop(
                     equity = (await _get_account_state(dispatcher, orchestrator.direct_executor, user_id)).equity
                 except Exception as exc:
                     logger.warning("account_state_unavailable", error=str(exc))
+                    mark_account_state_failed()
                     await asyncio.sleep(interval_s)
                     continue
+                mark_account_state_ok()
                 snapshot = MarketSnapshot.from_snapshot_engine(engine, equity_usdt=equity)
                 await orchestrator.process_market_tick(snapshot)
             else:
