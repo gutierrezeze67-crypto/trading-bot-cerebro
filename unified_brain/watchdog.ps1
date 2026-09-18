@@ -19,15 +19,33 @@ function Write-Log($msg) {
     Add-Content -Path $logPath -Value $line
 }
 
-function Test-BotHealthy($port) {
-    try {
-        $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$port/health" -TimeoutSec 5 -UseBasicParsing
-        if ($resp.StatusCode -ne 200) { return $false }
-        $body = $resp.Content | ConvertFrom-Json
-        return $body.status -eq "ok"
-    } catch {
-        return $false
+# 3 intentos espaciados 30s antes de declarar caido un bot: una falla puntual
+# (microcorte, pico de CPU del VPS) ya no dispara un reinicio; una falla real
+# (MT5 colgado) igual se detecta, con ~1 min extra. Cada intento fallido deja
+# el motivo exacto en watchdog.log.
+function Test-BotHealthy($port, $name) {
+    $attempts = 3
+    for ($i = 1; $i -le $attempts; $i++) {
+        $detail = ""
+        try {
+            $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$port/health" -TimeoutSec 15 -UseBasicParsing
+            $body = $resp.Content | ConvertFrom-Json
+            if ($resp.StatusCode -eq 200 -and $body.status -eq "ok") { return $true }
+            $detail = "HTTP $($resp.StatusCode) $($resp.Content)"
+        } catch {
+            $detail = $_.Exception.Message
+            $r = $_.Exception.Response
+            if ($r) {
+                try {
+                    $sr = New-Object System.IO.StreamReader($r.GetResponseStream())
+                    $detail = "$detail | $($sr.ReadToEnd())"
+                } catch {}
+            }
+        }
+        Write-Log "$name health $i/$attempts fallo: $detail"
+        if ($i -lt $attempts) { Start-Sleep -Seconds 30 }
     }
+    return $false
 }
 
 function Stop-PortOwner($port) {
@@ -43,7 +61,7 @@ function Stop-PortOwner($port) {
 }
 
 # --- Swing (Vantage, puerto 8002) ---
-if (-not (Test-BotHealthy 8002)) {
+if (-not (Test-BotHealthy 8002 "SWING")) {
     Write-Log "SWING no responde /health OK en :8002 -- reiniciando"
     Stop-PortOwner 8002
     Start-Sleep -Seconds 3
@@ -54,7 +72,7 @@ if (-not (Test-BotHealthy 8002)) {
 # --- Scalping (Exness, puerto 8003) -- solo si su archivo de secretos existe ---
 $scalpingEnvFile = Join-Path $root ".env.exness_zero_demo_200"
 if (Test-Path $scalpingEnvFile) {
-    if (-not (Test-BotHealthy 8003)) {
+    if (-not (Test-BotHealthy 8003 "SCALPING")) {
         Write-Log "SCALPING no responde /health OK en :8003 -- reiniciando"
         Stop-PortOwner 8003
         Start-Sleep -Seconds 3
