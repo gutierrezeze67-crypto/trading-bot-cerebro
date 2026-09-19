@@ -32,41 +32,13 @@ from config import constants as c  # noqa: E402
 ofs = bsa.ofs
 
 
-class LiveRealisticBracket(sr.Bracket):
-    """Como Bracket, pero si tras un TIME_STOP_TP1 el breakeven queda del lado
-    equivocado del precio (el broker no admite ese SL), el resto se cierra a
-    mercado en ese mismo cierre en vez de 'rellenar' en el BE (supuesto del backtest)."""
-
-    def on_bar(self, ts, high, low, close):
-        ev = super().on_bar(ts, high, low, close)
-        if any(e.kind == "TIME_STOP_TP1" for e in ev) and not self.closed and self.qty_open > 0:
-            wrong = self.be_price >= close if self.direction == "LONG" else self.be_price <= close
-            if wrong:
-                ev.append(sr.Event("BE_WRONG_SIDE", close, self.qty_open))
-                self.closed = True
-        return ev
-
-
-class IntendedRulesBracket(sr.Bracket):
-    """Regla tal como la describe decide()::management_notes: el SL pasa a BE
-    SOLO al tocar TP1. Tras el cierre del 50% por time-stop (sin TP1) el
-    resto conserva su SL original (ejecutable en cualquier broker)."""
-
-    def on_bar(self, ts, high, low, close):
-        sl0 = self.sl
-        ev = super().on_bar(ts, high, low, close)
-        if any(e.kind == "TIME_STOP_TP1" for e in ev) and not any(e.kind == "TP1_PARCIAL" for e in ev):
-            self.sl = sl0
-        return ev
-
-
-def simular_con_reglas_vivas(df, risk_manager, bracket_cls=None):
-    bracket_cls = bracket_cls or sr.Bracket
+def simular_con_reglas_vivas(df, risk_manager, mode="legacy_be"):
+    bracket_cls = sr.Bracket
     ofs._ZONE_COOLDOWNS.clear()
     gate = sr.EntryGate()
     params = sr.BracketParams(
         be_buffer=c.BREAKEVEN_BUFFER_PIPS, time_stop_tp1_min=c.TIME_STOP_TP1_MINUTES,
-        time_stop_close_min=c.TIME_STOP_CLOSE_MINUTES,
+        time_stop_close_min=c.TIME_STOP_CLOSE_MINUTES, time_stop_mode=mode,
     )
     equity = bsa.CAPITAL_BASE
     trades, posicion, daily_pnl = [], None, {}
@@ -84,6 +56,8 @@ def simular_con_reglas_vivas(df, risk_manager, bracket_cls=None):
             exit_cost = costs["exit_cost_usdt"]
             direccion = posicion["direccion"]
             for ev in b.on_bar(ts.timestamp(), fila["high"], fila["low"], fila["close"]):
+                if not (fila["low"] - 1e-9 <= ev.price <= fila["high"] + 1e-9):
+                    posicion["fills_fuera_de_rango"] = posicion.get("fills_fuera_de_rango", 0) + 1
                 precio_real = ev.price - exit_cost if direccion == "LONG" else ev.price + exit_cost
                 signo = 1 if direccion == "LONG" else -1
                 posicion["pnl_usdt"] += signo * (precio_real - posicion["entry_price"]) * ev.qty
@@ -186,8 +160,8 @@ def comparar(ref: list, vivo: list) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--live-realistic", action="store_true", help="sensibilidad: BE inejecutable tras time-stop -> cierre a mercado")
-    ap.add_argument("--intended", action="store_true", help="sensibilidad: SL a BE solo al tocar TP1 (management_notes de decide())")
+    ap.add_argument("--mode", default="legacy_be", choices=["legacy_be", "keep_sl", "close_all", "conditional_be"],
+                    help="que hacer en el time-stop de 10 min (legacy_be = replica exacta del backtest validado, con fill fantasma)")
     ap.add_argument("--small", action="store_true", help="$200, riesgo 6.25%%, paso 0.01 (regimen real del bot)")
     args = ap.parse_args()
 
@@ -215,9 +189,11 @@ def main() -> int:
         for (ini, fin) in windows:
             dfw = df_1m[(df_1m["open_time"] >= ini) & (df_1m["open_time"] < fin)].reset_index(drop=True)
             ref.extend(bsa.simular_ventana(dfw, rm, regime_atr_pctl=None, vd_threshold=None, trailing_mult=None)[0])
-            vivo.extend(simular_con_reglas_vivas(dfw, rm, LiveRealisticBracket if args.live_realistic else (IntendedRulesBracket if args.intended else None)))
+            vivo.extend(simular_con_reglas_vivas(dfw, rm, args.mode))
 
-        if args.live_realistic or args.intended:
+        fantasma = sum(t.get("fills_fuera_de_rango", 0) for t in vivo)
+        print(f"modo={args.mode}: fills fuera del rango alto-bajo de su vela (fantasma/gap) = {fantasma} en {len(vivo)} trades")
+        if args.mode != "legacy_be":
             dias = (windows[-1][1] - windows[0][0]).total_seconds() / 86400
             for nombre, tr in (("backtest validado", ref), ("variante", vivo)):
                 m = bsa.calcular_metricas(tr, dias)

@@ -217,30 +217,11 @@ def test_expert_blocks_when_position_open_and_evaluates_each_candle_once():
     assert e.analyze(_snap(_payload("14:30:00"))) is None  # misma vela: no re-evalua
 
 
-def _bracket(be_on_time_stop):
-    return Bracket("LONG", 100_000.0, 99_750.0, 100_600.0, 101_000.0, 0.05, 0.02, T0,
-                   BracketParams(be_buffer=100.0, time_stop_tp1_min=10, time_stop_close_min=30, be_on_time_stop=be_on_time_stop))
-
-
-def test_be_on_time_stop_flag_controls_stop_after_time_stop_but_not_after_tp1():
-    b = _bracket(True)
-    b.on_bar(T0 + 600, 100_050.0, 100_050.0, 100_050.0)
-    assert b.sl == 100_100.0  # comportamiento del backtest validado
-
-    b = _bracket(False)
-    b.on_bar(T0 + 600, 100_050.0, 100_050.0, 100_050.0)
-    assert b.sl == 99_750.0 and b.tp1_hit  # SL original intacto
-
-    b = _bracket(False)
-    b.on_bar(T0 + 60, 100_601.0, 100_601.0, 100_601.0)
-    assert b.sl == 100_100.0  # al tocar TP1 siempre pasa a BE
-
-
-def test_live_manager_keeps_original_stop_after_time_stop_when_flag_off(tmp_path):
+def test_live_manager_keep_sl_mode_leaves_original_stop_after_time_stop(tmp_path):
     ex, clock, gate = FakeExecutor(), Clock(), EntryGate()
     ex.positions[1] = _long_position()
     ex.bid = ex.ask = 100_000.0
-    params = BracketParams(be_buffer=100.0, time_stop_tp1_min=10, time_stop_close_min=30, be_on_time_stop=False)
+    params = BracketParams(be_buffer=100.0, time_stop_tp1_min=10, time_stop_close_min=30, time_stop_mode="keep_sl")
     mgr = LiveBracketManager(ex, gate, params, tmp_path / "s.json", clock=clock)
     mgr.register(SimpleNamespace(ticket=1, tp=100_600.0, volume=0.05, price=100_000.0))
     mgr._sync_step()
@@ -248,5 +229,39 @@ def test_live_manager_keeps_original_stop_after_time_stop_when_flag_off(tmp_path
     clock.now += 10 * 60
     mgr._sync_step()
     assert ex.positions[1].volume == pytest.approx(0.03)
-    assert ex.positions[1].sl == 99_750.0  # no se toca el SL: sigue vivo el corredor
+    assert ex.positions[1].sl == 99_750.0  # SL original intacto: el corredor sigue vivo
     assert not any(c[0] == "modify" and c[2] == 100_100.0 for c in ex.calls)
+
+
+def _live_mode_manager(tmp_path, mode, volume=0.05):
+    ex, clock, gate = FakeExecutor(), Clock(), EntryGate()
+    ex.positions[1] = _long_position(volume=volume)
+    ex.bid = ex.ask = 100_000.0
+    params = BracketParams(be_buffer=100.0, time_stop_tp1_min=10, time_stop_close_min=30, time_stop_mode=mode)
+    mgr = LiveBracketManager(ex, gate, params, tmp_path / f"{mode}.json", clock=clock)
+    mgr.register(SimpleNamespace(ticket=1, tp=100_600.0, volume=volume, price=100_000.0))
+    mgr._sync_step()
+    return ex, clock, mgr
+
+
+def test_live_close_all_mode_closes_everything_at_10_min(tmp_path):
+    ex, clock, mgr = _live_mode_manager(tmp_path, "close_all")
+    ex.bid = ex.ask = 100_050.0
+    clock.now += 10 * 60
+    mgr._sync_step()
+    assert 1 not in ex.positions
+    assert [c for c in ex.calls if c[0] == "close"] == [("close", 1, None)]  # un solo cierre total
+
+
+def test_live_conditional_be_mode_closes_rest_when_be_invalid_and_keeps_it_when_valid(tmp_path):
+    ex, clock, mgr = _live_mode_manager(tmp_path, "conditional_be")
+    ex.bid = ex.ask = 100_050.0  # BE (100_100) inejecutable
+    clock.now += 10 * 60
+    mgr._sync_step()
+    assert 1 not in ex.positions
+
+    ex, clock, mgr = _live_mode_manager(tmp_path, "conditional_be")
+    ex.bid = ex.ask = 100_200.0  # BE valido
+    clock.now += 10 * 60
+    mgr._sync_step()
+    assert ex.positions[1].volume == pytest.approx(0.03) and ex.positions[1].sl == 100_100.0

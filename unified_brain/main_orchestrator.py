@@ -249,9 +249,9 @@ def build_default_orchestrator(symbol: str = "BTCUSDT", user_id: str = "default"
         params = BracketParams(
             be_buffer=_constants.BREAKEVEN_BUFFER_PIPS, time_stop_tp1_min=_constants.TIME_STOP_TP1_MINUTES,
             time_stop_close_min=_constants.TIME_STOP_CLOSE_MINUTES,
-            # False por default: el backtest validado rellena el BE tras el time-stop a un
-            # precio que el broker no admite (ver scripts/parity_check_scalping.py).
-            be_on_time_stop=os.environ.get("SCALPING_BE_ON_TIME_STOP", "false").strip().lower() == "true",
+            # legacy_be = replica del backtest validado (fill fantasma, NO usar en vivo). Ver
+            # scripts/parity_check_scalping.py --mode y BracketParams.time_stop_mode.
+            time_stop_mode=os.environ.get("SCALPING_TIME_STOP_MODE", "keep_sl").strip().lower(),
         )
         scalping_manager = LiveBracketManager(
             direct_executor, gate, params, Path(__file__).resolve().parent / "scalping_state.json",

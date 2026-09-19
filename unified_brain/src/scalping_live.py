@@ -188,7 +188,9 @@ class LiveBracketManager:
             if ev.kind in ("TP1_PARCIAL", "TIME_STOP_TP1"):
                 if not self._partial_close(ticket, b, pos, ev, price):
                     break
-            elif ev.kind == "TIME_STOP_CLOSE":
+            elif ev.kind == "TS10_BE_INVALID":
+                continue  # ya lo resolvio _apply_breakeven (BE del lado equivocado -> cierra el resto)
+            elif ev.kind in ("TIME_STOP_CLOSE", "TIME_STOP_10M"):
                 res = self.executor.close_position(ticket)
                 logger.info("scalping_time_stop_close", ticket=ticket, ok=res.success, error=res.error)
                 break

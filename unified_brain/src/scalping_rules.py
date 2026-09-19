@@ -64,11 +64,15 @@ class BracketParams:
     be_buffer: float = VALIDATED_CONSTANTS["BREAKEVEN_BUFFER_PIPS"]
     time_stop_tp1_min: float = VALIDATED_CONSTANTS["TIME_STOP_TP1_MINUTES"]
     time_stop_close_min: float = VALIDATED_CONSTANTS["TIME_STOP_CLOSE_MINUTES"]
-    # True = comportamiento EXACTO del backtest validado: tras el cierre del 50%
-    # por time-stop el SL pasa a breakeven (el backtest lo 'rellena' aunque el
-    # precio ya este por debajo: no ejecutable en un broker real). False = el SL
-    # pasa a BE solo al tocar TP1 (regla de decide()::management_notes).
-    be_on_time_stop: bool = True
+    # Que hacer al llegar al time-stop 1 (sin TP1):
+    #   legacy_be      = replica EXACTA del backtest validado: cierra el 50% y pasa el SL a
+    #                    BE, que el simulador 'rellena' aunque el precio ya este por debajo
+    #                    (fill fantasma, NO ejecutable). Solo para paridad/comparacion.
+    #   keep_sl        = cierra el 50%; el resto conserva su SL original.
+    #   close_all      = cierra el 100% a mercado (Propuesta 1).
+    #   conditional_be = cierra el 50%; si el BE es un stop valido (precio mas alla) el SL
+    #                    pasa a BE, si no cierra el resto a mercado (Propuesta 2).
+    time_stop_mode: str = "legacy_be"
 
 
 class Bracket:
@@ -100,11 +104,15 @@ class Bracket:
     def _post_tp1(self) -> None:
         self.sl = self.be_price
 
+    def _be_wrong_side(self, price: float) -> bool:
+        """True si el BE no es un stop valido: en LONG el SL tiene que quedar por debajo del precio."""
+        return self.be_price >= price if self.direction == "LONG" else self.be_price <= price
+
     def mark_partial(self, kind: str = "TP1_PARCIAL") -> None:
         """Aplica el efecto de un TP1_PARCIAL/TIME_STOP_TP1 ya ejecutado en el broker."""
         self.tp1_hit = True
         self.qty_open = self.qty_total - self.qty_tp1
-        if kind == "TP1_PARCIAL" or self.params.be_on_time_stop:
+        if kind == "TP1_PARCIAL" or self.params.time_stop_mode in ("legacy_be", "conditional_be"):
             self._post_tp1()
 
     def to_dict(self) -> dict:
@@ -147,11 +155,24 @@ class Bracket:
                 return events
 
         if not self.tp1_hit and hold_min >= self.params.time_stop_tp1_min:
+            mode = self.params.time_stop_mode
+            if mode == "close_all":
+                events.append(Event("TIME_STOP_10M", close, self.qty_open))
+                self.closed = True
+                return events
             events.append(Event("TIME_STOP_TP1", close, self.qty_tp1))
             self.qty_open = self.qty_total - self.qty_tp1
             self.tp1_hit = True
-            if self.params.be_on_time_stop:
+            if mode == "legacy_be":
                 self._post_tp1()
+            elif self.qty_open <= 1e-12:
+                self.closed = True  # lote chico: el 'cierre del 50%' fue toda la posicion
+            elif mode == "conditional_be":
+                if self._be_wrong_side(close):
+                    events.append(Event("TS10_BE_INVALID", close, self.qty_open))
+                    self.closed = True
+                else:
+                    self._post_tp1()
         elif hold_min >= self.params.time_stop_close_min:
             events.append(Event("TIME_STOP_CLOSE", close, self.qty_open))
             self.closed = True
