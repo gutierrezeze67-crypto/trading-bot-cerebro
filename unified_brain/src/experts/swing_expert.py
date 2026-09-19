@@ -10,11 +10,22 @@ from src.schemas.market import MarketSnapshot
 from src.schemas.signals import PatternName, UnifiedSignal
 
 
+# Tope de sanidad del ATR14 de 15m como % del precio. BTC real desde 2026-02:
+# mediana 0.26%, p99.9 1.7%, maximo 2.09% -- 3% nunca bloquea un trade
+# legitimo. Un ATR mayor es dato corrupto (2026-09-18: 7.49% -> SL a 9%).
+MAX_ATR_PCT = 0.03
+
+
 class SwingExpert(BaseExpert):
     def __init__(self, params: HTFParams | None = None, asset_cfg: dict | None = None) -> None:
         self.brain = HTFFundingBrain(params=params, asset_cfg=asset_cfg)
 
     def analyze(self, snapshot: MarketSnapshot) -> UnifiedSignal | None:
+        atr = snapshot.htf_context.get("atr14_15m")
+        close = snapshot.htf_vela.get("close")
+        if atr and close and atr / close > MAX_ATR_PCT:
+            self.brain.last_reject_reason = f"ATR_ABSURDO ({atr / close:.1%} > {MAX_ATR_PCT:.0%}, dato corrupto)"
+            return None
         raw = self.brain.decide(snapshot.htf_vela, snapshot.htf_context, snapshot.ts_ms)
         if raw is None:
             return None

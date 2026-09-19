@@ -296,6 +296,12 @@ class SnapshotEngine:
             }
             self._cerrar_vela(vela, es_backfill=True)
 
+        # Sembrar el ultimo precio valido con el ultimo cierre real del
+        # backfill: asi el PRIMER trade en vivo tambien pasa por el filtro de
+        # desviacion >10% de _handle_trade (antes arrancaba sin referencia).
+        if self._ultimo_precio_valido <= 0 and self.klines_1m:
+            self._ultimo_precio_valido = float(self.klines_1m[-1]["c"])
+
         self._recalcular_htf()
         logger.info(
             f"🕯️ Backfill REST completo: {len(self.klines_1m)} velas 1m cargadas "
@@ -459,6 +465,14 @@ class SnapshotEngine:
         qty = float(event["q"])
         es_venta_agresiva = bool(event["m"])  # m=True: comprador es maker -> vendedor agrede
         ts = event["T"] / 1000
+
+        # Un precio <= 0 es dato corrupto siempre. Sin esto, el PRIMER trade de
+        # un arranque (cuando _ultimo_precio_valido todavia es 0.0 y el filtro
+        # de abajo no corre) con p=0 dejaba una vela con low=0 -> TR ~ precio
+        # entero -> ATR14 inflado ~20x durante ~3.5h -> SL/TP absurdos en el
+        # swing (2026-09-18: SL a 9% en vez de ~0.4%).
+        if price <= 0:
+            return
 
         if self._ultimo_precio_valido > 0:
             desviacion = abs(price - self._ultimo_precio_valido) / self._ultimo_precio_valido
