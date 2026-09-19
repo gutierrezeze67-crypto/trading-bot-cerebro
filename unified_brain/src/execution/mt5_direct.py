@@ -329,7 +329,9 @@ class MT5DirectExecutor:
             logger.error("mt5_direct_execute_error", error=str(exc))
             return OrderResult(success=False, error=str(exc))
 
-    def close_position(self, ticket: int, deviation: int | None = None) -> OrderResult:
+    def close_position(self, ticket: int, deviation: int | None = None, volume: float | None = None) -> OrderResult:
+        """volume=None cierra la posicion entera (comportamiento original);
+        un volume menor al de la posicion es un cierre PARCIAL."""
         if not self.is_connected():
             return OrderResult(success=False, error="No conectado a MT5")
 
@@ -338,6 +340,12 @@ class MT5DirectExecutor:
             if not positions:
                 return OrderResult(success=False, error=f"Posicion {ticket} no encontrada")
             pos = positions[0]
+            close_volume = pos.volume
+            if volume is not None:
+                symbol_info = mt5.symbol_info(pos.symbol)
+                if not symbol_info:
+                    return OrderResult(success=False, error=f"No se obtuvo symbol_info para {pos.symbol}")
+                close_volume = min(pos.volume, self._normalize_volume(volume, symbol_info))
 
             tick = mt5.symbol_info_tick(pos.symbol)
             if not tick:
@@ -351,7 +359,7 @@ class MT5DirectExecutor:
             request: dict[str, Any] = {
                 "action": mt5.TRADE_ACTION_DEAL,
                 "symbol": pos.symbol,
-                "volume": pos.volume,
+                "volume": close_volume,
                 "type": close_type,
                 "position": ticket,
                 "price": self._resolve_price(tick, side_is_buy),
@@ -401,6 +409,79 @@ class MT5DirectExecutor:
             return []
         positions = mt5.positions_get()
         return list(positions) if positions else []
+
+    def get_position_state(self, ticket: int) -> tuple[str, Any | None]:
+        """("OPEN", pos) | ("CLOSED", None) | ("UNKNOWN", None). UNKNOWN =
+        sin conexion o error de MT5: quien llama NO debe asumir que cerro."""
+        if not self.is_connected():
+            return "UNKNOWN", None
+        try:
+            positions = mt5.positions_get(ticket=ticket)
+        except Exception:  # noqa: BLE001
+            return "UNKNOWN", None
+        if positions is None:
+            return "UNKNOWN", None
+        if len(positions) == 0:
+            return "CLOSED", None
+        return "OPEN", positions[0]
+
+    def list_own_positions(self) -> list[Any] | None:
+        """Posiciones abiertas con el magic de este ejecutor; None si MT5 fallo."""
+        if not self.is_connected():
+            return None
+        positions = mt5.positions_get()
+        if positions is None:
+            return None
+        return [p for p in positions if p.magic == self.config["magic"]]
+
+    def get_bid_ask(self, symbol: str | None = None) -> tuple[float, float] | None:
+        tick = mt5.symbol_info_tick(symbol or self.symbol)
+        if not tick or tick.bid <= 0 or tick.ask <= 0:
+            return None
+        return tick.bid, tick.ask
+
+    def modify_position(self, ticket: int, sl: float | None = None, tp: float | None = None) -> OrderResult:
+        """Cambia SL y/o TP de una posicion abierta (lo no indicado se conserva)."""
+        if not self.is_connected():
+            return OrderResult(success=False, error="No conectado a MT5")
+        try:
+            positions = mt5.positions_get(ticket=ticket)
+            if not positions:
+                return OrderResult(success=False, error=f"Posicion {ticket} no encontrada")
+            pos = positions[0]
+            request = {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "symbol": pos.symbol,
+                "position": ticket,
+                "sl": float(sl if sl is not None else pos.sl),
+                "tp": float(tp if tp is not None else pos.tp),
+                "magic": pos.magic,
+            }
+            result = mt5.order_send(request)
+            if result is None:
+                return OrderResult(success=False, error=f"modify None: {mt5.last_error()}")
+            # 10025 = "sin cambios": el SL/TP ya estaba asi, es exito para nosotros.
+            if result.retcode in (mt5.TRADE_RETCODE_DONE, 10025):
+                return OrderResult(success=True, ticket=ticket, retcode=result.retcode, comment=result.comment)
+            return OrderResult(success=False, error=f"retcode {result.retcode}: {result.comment}", retcode=result.retcode, comment=result.comment)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("mt5_direct_modify_error", error=str(exc))
+            return OrderResult(success=False, error=str(exc))
+
+    def get_close_info(self, ticket: int) -> dict[str, Any] | None:
+        """Motivo (SL/TP/OTHER) y pnl total de una posicion ya cerrada, o None."""
+        try:
+            deals = mt5.history_deals_get(position=ticket)
+        except Exception:  # noqa: BLE001
+            return None
+        if not deals:
+            return None
+        outs = [d for d in deals if d.entry in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_OUT_BY, mt5.DEAL_ENTRY_INOUT)]
+        if not outs:
+            return None
+        last = max(outs, key=lambda d: d.time)
+        reason = {mt5.DEAL_REASON_SL: "SL", mt5.DEAL_REASON_TP: "TP"}.get(last.reason, "OTHER")
+        return {"reason": reason, "pnl": sum(d.profit + d.swap + d.commission for d in deals)}
 
     def get_position_status(self, ticket: int) -> dict[str, Any]:
         """Estado real de un trade por ticket -- lo que signal_orchestrator.py

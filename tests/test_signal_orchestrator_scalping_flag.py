@@ -68,6 +68,9 @@ class _FakeRiskManager:
 
 
 def test_real_decide_signal_converts_to_unified_signal():
+    import src.order_flow_signal as ofs_live
+
+    ofs_live._ZONE_COOLDOWNS.clear()  # estado global de modulo: aislar de otros tests
     price = 77850.0
     payload = {
         "htf_ready": True,

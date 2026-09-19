@@ -245,7 +245,7 @@ class SignalOrchestrator:
                     side="BUY" if signal.direction == "LONG" else "SELL",
                     volume=risk_result.adjusted_lot,
                     sl=signal.sl_price,
-                    tp=signal.tp_price,
+                    tp=signal.metadata.get("exec_tp_price") or signal.tp_price,
                     comment=f"UB:{signal.strategy_type[:4]}:{signal.pattern_name.value[:12]}"[:31],
                 )
                 exec_result = _direct_result_to_execution_result(direct_result, signal)

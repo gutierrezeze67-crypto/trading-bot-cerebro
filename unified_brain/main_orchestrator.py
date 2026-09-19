@@ -24,6 +24,8 @@ from src.execution.mcp_dispatcher import MCPDispatcher, MCPDispatcherConfig, MCP
 from src.execution.mt5_direct import MT5DirectExecutor
 from src.experts.base_expert import NullExpert
 from src.experts.scalping_expert import ScalpingExpert
+from src.scalping_live import LiveBracketManager
+from src.scalping_rules import BracketParams, EntryGate, apply_validated_constants
 from src.experts.swing_expert import SwingExpert
 from src.risk.risk_engine import RiskEngine
 from src.risk.risk_manager import RiskManager
@@ -167,8 +169,6 @@ def build_default_orchestrator(symbol: str = "BTCUSDT", user_id: str = "default"
     capital_inicial = float(os.environ.get("UNIFIED_BRAIN_CAPITAL_INICIAL", "50000"))
     risk_manager = RiskManager(firestore_client=None, capital_inicial=capital_inicial)
 
-    scalping_expert = ScalpingExpert(risk_manager=risk_manager)
-
     # HTFFundingBrain.decide() filtra señales por costo neto (min_rr_net,
     # ver HTFParams) -- sin esto SIEMPRE usaba el ASSET_CONFIG base
     # (config/assets.py), el mas barato posible (perfil institucional
@@ -236,6 +236,30 @@ def build_default_orchestrator(symbol: str = "BTCUSDT", user_id: str = "default"
     if direct_executor is not None:
         logger.info("mt5_direct_execution_enabled", note="ordenes via mt5_direct.py, lecturas via mcp_dispatcher")
 
+    scalping_manager = None
+    if enable_scalping and direct_executor is None:
+        logger.error("scalping_disabled", reason="requiere MT5_DIRECT_EXECUTION=true para gestionar TP1/BE/time-stops")
+        enable_scalping = False
+    if enable_scalping:
+        from config import constants as _constants
+
+        previos = apply_validated_constants(_constants)
+        logger.info("scalping_validated_constants_applied", previos=previos)
+        gate = EntryGate()
+        params = BracketParams(
+            be_buffer=_constants.BREAKEVEN_BUFFER_PIPS, time_stop_tp1_min=_constants.TIME_STOP_TP1_MINUTES,
+            time_stop_close_min=_constants.TIME_STOP_CLOSE_MINUTES,
+            # False por default: el backtest validado rellena el BE tras el time-stop a un
+            # precio que el broker no admite (ver scripts/parity_check_scalping.py).
+            be_on_time_stop=os.environ.get("SCALPING_BE_ON_TIME_STOP", "false").strip().lower() == "true",
+        )
+        scalping_manager = LiveBracketManager(
+            direct_executor, gate, params, Path(__file__).resolve().parent / "scalping_state.json",
+        )
+        scalping_expert = ScalpingExpert(risk_manager=risk_manager, gate=gate, position_open_fn=scalping_manager.has_open_position)
+    else:
+        scalping_expert = ScalpingExpert(risk_manager=risk_manager)
+
     orchestrator = SignalOrchestrator(
         scalping_expert=scalping_expert,
         swing_expert=swing_expert,
@@ -249,7 +273,9 @@ def build_default_orchestrator(symbol: str = "BTCUSDT", user_id: str = "default"
         direct_executor=direct_executor,
         risk_overrides_provider=lambda: manager.get_risk_overrides(user_id),
         enable_scalping=enable_scalping,
+        on_trade_executed=scalping_manager.register if scalping_manager else None,
     )
+    orchestrator.scalping_manager = scalping_manager
     return orchestrator, engine, dispatcher
 
 
@@ -328,6 +354,7 @@ async def main() -> None:
         await asyncio.gather(
             run_market_loop(engine, orchestrator, dispatcher, user_id),
             reconcile_trade_status_loop(orchestrator.direct_executor, user_id),
+            *([orchestrator.scalping_manager.run()] if orchestrator.scalping_manager else []),
             server.serve(),
         )
     finally:
