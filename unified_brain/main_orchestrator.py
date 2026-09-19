@@ -197,6 +197,12 @@ def build_default_orchestrator(symbol: str = "BTCUSDT", user_id: str = "default"
     else:
         logger.info("swing_expert_disabled", reason="UNIFIED_BRAIN_ENABLE_SWING=false")
         swing_expert = NullExpert()
+    # Scalping: por default solo se enciende si el swing esta apagado (el
+    # proceso dedicado a scalping); el proceso swing conserva scalping apagado.
+    # UNIFIED_BRAIN_ENABLE_SCALPING=true/false fuerza el valor.
+    scalping_env = os.environ.get("UNIFIED_BRAIN_ENABLE_SCALPING", "").strip().lower()
+    enable_scalping = (scalping_env == "true") if scalping_env else (not enable_swing)
+    logger.info("scalping_expert_enabled" if enable_scalping else "scalping_expert_disabled")
     router = DeterministicRouter()
     # Lote fijo (RISK_FIXED_LOT_OVERRIDE): pensado para cuentas chicas donde
     # el risk_pct_per_trade default (0.5%) fuerza el lote minimo del broker
@@ -242,6 +248,7 @@ def build_default_orchestrator(symbol: str = "BTCUSDT", user_id: str = "default"
         user_id=user_id,
         direct_executor=direct_executor,
         risk_overrides_provider=lambda: manager.get_risk_overrides(user_id),
+        enable_scalping=enable_scalping,
     )
     return orchestrator, engine, dispatcher
 

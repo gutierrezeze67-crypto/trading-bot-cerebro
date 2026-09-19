@@ -116,7 +116,9 @@ class SignalOrchestrator:
         risk_overrides_provider: Callable[[], dict[str, float]] | None = None,
         zone_cache: ZoneCache | None = None,
         sensei_generator: "SenseiZoneGenerator | None" = None,
+        enable_scalping: bool = False,
     ) -> None:
+        self.enable_scalping = enable_scalping
         self.scalping_expert = scalping_expert
         self.swing_expert = swing_expert
         self.router = router
@@ -191,14 +193,15 @@ class SignalOrchestrator:
             risk_config = self._effective_risk_config()
             risk_engine = self.risk_engine if risk_config is self.risk_engine.config else RiskEngine(risk_config)
 
-            # ScalpingExpert desactivado para este deployment: backtest real
-            # (walk-forward + out-of-time, ~465 trades) mostro PF 0.30 en
-            # cuentas de fondeo (FundedNext/FundingPips) -- los costos lo
-            # destruyen -- mientras que SwingExpert solo sostiene PF 2.65-3.00,
-            # y combinar ambos en el router diluye el resultado a PF 2.03. No
-            # se toca ScalpingExpert.analyze() ni el Router: scalping
-            # simplemente no le propone candidatos al router en este deploy.
+            # ScalpingExpert apagado por default (enable_scalping=False): backtest
+            # real (~465 trades) mostro PF 0.30 en cuentas de fondeo
+            # (FundedNext/FundingPips) porque los costos lo destruyen, y
+            # combinarlo con swing en el router diluye el PF de 2.65-3.00 a
+            # 2.03. Solo el proceso dedicado a scalping (Exness Zero, spread
+            # propio ~0) lo enciende -- ver main_orchestrator.py.
             scalp_signal = None
+            if self.enable_scalping:
+                scalp_signal = await asyncio.to_thread(self.scalping_expert.analyze, snapshot)
             swing_signal = await asyncio.to_thread(self.swing_expert.analyze, snapshot)
 
             context = self.build_router_context(snapshot)
