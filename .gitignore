@@ -1,5 +1,8 @@
 # Credenciales - NUNCA commitear
 .env
+# archivos de secretos por bot (.env.<bot>); las plantillas .example si se versionan
+.env.*
+!.env.*.example
 config/settings.py
 config/firebase-service-account.json
 scripts/test_mcp_final.py  # tiene login/password de la cuenta MT5 demo hardcodeados a pedido
