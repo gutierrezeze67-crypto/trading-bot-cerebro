@@ -1,14 +1,13 @@
-# Watchdog real de los 2 procesos de unified_brain (swing puerto 8002,
-# scalping puerto 8003). Se registra en el Programador de Tareas como
-# "UnifiedBrainWatchdog" corriendo cada 5 min.
+# Watchdog del SWING unicamente (puerto 8002). Se registra en el Programador de
+# Tareas como "UnifiedBrainWatchdog" corriendo cada 5 min.
 #
-# ANTES este script solo chequeaba "existe algun proceso llamado python" --
-# eso NUNCA detecta que la conexion Python-MT5 murio por dentro sin que el
-# proceso se caiga (confirmado en vivo 2026-08-31/09-09: 9 dias sin operar,
-# /health devolviendo "ok" fijo todo el tiempo, python.exe vivo todo el
-# tiempo). Ahora chequea /health de cada puerto -- que si refleja la
-# conexion MT5 real desde el fix en api.py -- y reinicia SOLO el bot que
-# esta roto, no los dos a ciegas.
+# El scalping (puerto 8003) vive en su propia instalacion (C:\bots\scalping) con
+# su propio watchdog: este script NO lo mira, NO lo reinicia y NO lo lanza.
+# Rama swing-prod: el codigo del swing solo cambia por decision explicita, nunca
+# por un `git pull` del trabajo de scalping.
+#
+# Chequea /health -- que refleja la conexion MT5 real (ver api.py) -- y reinicia
+# el bot solo tras 3 fallas seguidas espaciadas.
 $ErrorActionPreference = "Continue"
 $root = "C:\trading-bot-cerebro\unified_brain"
 Set-Location $root
@@ -67,16 +66,4 @@ if (-not (Test-BotHealthy 8002 "SWING")) {
     Start-Sleep -Seconds 3
     Start-Process -FilePath "cmd.exe" -ArgumentList '/c set PYTHONUNBUFFERED=1 && "C:\Program Files\Python311\python.exe" -u main_orchestrator.py >> "service-out.log" 2>> "service-err.log"' -WorkingDirectory $root -WindowStyle Hidden
     Write-Log "SWING relanzado"
-}
-
-# --- Scalping (Exness, puerto 8003) -- solo si su archivo de secretos existe ---
-$scalpingEnvFile = Join-Path $root ".env.exness_zero_demo_200"
-if (Test-Path $scalpingEnvFile) {
-    if (-not (Test-BotHealthy 8003 "SCALPING")) {
-        Write-Log "SCALPING no responde /health OK en :8003 -- reiniciando"
-        Stop-PortOwner 8003
-        Start-Sleep -Seconds 3
-        & (Join-Path $root "start_scalping.ps1")
-        Write-Log "SCALPING relanzado"
-    }
 }
