@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 COMBINED_WS_URL_TMPL = "wss://fstream.binance.com/stream?streams={streams}"
 DEPTH_REST_URL_TMPL = "https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit=1000"
-KLINES_REST_URL_TMPL = "https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=1m&limit={limit}"
+KLINES_REST_URL_TMPL = "https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
 
 MAX_TRADES_BUFFER = 20_000
 MAX_KLINES_1M = 250  # suficiente para resamplear ~80 velas de 3m
@@ -183,6 +183,7 @@ class SnapshotEngine:
             return
         self._running = True
         await self._backfill_klines_1m()
+        await self._backfill_swing_h4()
         self._tasks = [
             asyncio.create_task(self._run_forever(), name="ws_loop"),
             asyncio.create_task(self._periodic_htf(), name="htf_loop"),
@@ -267,7 +268,7 @@ class SnapshotEngine:
         vacíos/neutros en las velas de backfill: no hay ese dato
         histórico, no se inventa."""
         loop = asyncio.get_event_loop()
-        url = KLINES_REST_URL_TMPL.format(symbol=self.symbol, limit=MAX_KLINES_1M)
+        url = KLINES_REST_URL_TMPL.format(symbol=self.symbol, interval="1m", limit=MAX_KLINES_1M)
         try:
             resp = await loop.run_in_executor(None, lambda: requests.get(url, timeout=15))
             raw = resp.json()
@@ -300,6 +301,50 @@ class SnapshotEngine:
         logger.info(
             f"🕯️ Backfill REST completo: {len(self.klines_1m)} velas 1m cargadas "
             f"({'HTF listo' if self.htf_listo() else 'HTF aún no listo'})"
+        )
+
+    async def _backfill_swing_h4(self) -> None:
+        """Trae por REST las ultimas c.SWING_H4_LOOKBACK velas H4 ya cerradas
+        para sembrar swing_high_h4/swing_low_h4 -- una de las 5 zonas
+        institucionales que vigila brain_htf_funding.py (POC/VAH/VAL/swing
+        H4 alto/bajo). Sin esto, _recompute_swings_h4() depende de que se
+        acumulen velas H4 EN VIVO desde _cerrar_vela: minimo 20 velas (80h,
+        ~3.3 dias) para el primer valor, 96 (16 dias) para el lookback
+        completo -- cada reinicio del proceso pagaba ese warmup de nuevo
+        (confirmado en vivo 2026-09-23: swing_high_h4/low_h4 en None varios
+        dias despues de cada reinicio). Mismo criterio que
+        _backfill_klines_1m: datos reales de Binance, no inventados; delta
+        via taker_buy_base_vol."""
+        loop = asyncio.get_event_loop()
+        url = KLINES_REST_URL_TMPL.format(symbol=self.symbol, interval="4h", limit=c.SWING_H4_LOOKBACK)
+        try:
+            resp = await loop.run_in_executor(None, lambda: requests.get(url, timeout=15))
+            raw = resp.json()
+        except Exception as e:
+            logger.error(f"❌ Error trayendo backfill REST de velas H4: {e}")
+            return
+
+        if not isinstance(raw, list) or not raw:
+            logger.warning("⚠️ Backfill REST de velas H4 vacío o inválido, swing_high_h4/low_h4 arranca en frío")
+            return
+
+        ahora_ms = time.time() * 1000
+        for k in raw:
+            open_time_ms, o, h, l, c_, vol, close_time_ms, _, _, taker_buy_vol, *_ = k
+            if close_time_ms > ahora_ms:
+                continue  # vela H4 todavia en formacion en Binance, no cerrada
+            buy_vol = float(taker_buy_vol)
+            volume = float(vol)
+            self._candles_h4.append({
+                "open_time": open_time_ms / 1000,
+                "open": float(o), "high": float(h), "low": float(l), "close": float(c_),
+                "volume": volume, "delta": buy_vol - max(volume - buy_vol, 0.0),
+            })
+
+        self._recompute_swings_h4()
+        logger.info(
+            f"🕯️ Backfill REST H4 completo: {len(self._candles_h4)} velas H4 cargadas "
+            f"(swing_high_h4={self._htf_cache.get('swing_high_h4')} swing_low_h4={self._htf_cache.get('swing_low_h4')})"
         )
 
     async def _bootstrap_orderbook(self) -> None:
