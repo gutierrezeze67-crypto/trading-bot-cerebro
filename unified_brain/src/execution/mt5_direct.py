@@ -40,6 +40,7 @@ sobreescribir/agregar brokers sin tocar este archivo.
 """
 from __future__ import annotations
 
+import datetime as dt
 import os
 import time
 from dataclasses import dataclass
@@ -401,6 +402,38 @@ class MT5DirectExecutor:
             return []
         positions = mt5.positions_get()
         return list(positions) if positions else []
+
+    def get_today_stats(self) -> dict[str, Any] | None:
+        """trades_today (deals con entry=DEAL_ENTRY_IN desde medianoche UTC) y
+        realized_pnl_today (profit+swap+commission+fee de TODOS los deals de
+        hoy) -- mismo criterio que mcp_dispatcher.py::get_account_state.
+        Existe porque el camino MCP nunca conecta en produccion (ver
+        docstring de main_orchestrator._get_account_state, siempre cae a
+        este ejecutor directo); sin esto, el camino directo devolvia
+        trades_today=0 fijo y equity_start_of_day=balance actual siempre
+        (0 diferencia con equity => daily_pnl_pct=0 salvo por el PnL
+        flotante de una posicion ABIERTA), dejando el limite diario de
+        perdida (RiskConfig.max_daily_loss_pct) y el tope de trades/dia
+        (max_trades_per_day) sin efecto real -- confirmado en vivo
+        2026-09-23 (334k evaluaciones de router_hold en 25 dias reales,
+        ~35% con hold_reason=RISK_BLOCKED_DD/TRADES sin que el limite
+        diario real se hubiera tocado nunca)."""
+        if not self.is_connected():
+            return None
+        try:
+            hoy_utc = dt.datetime.now(dt.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+            deals = mt5.history_deals_get(hoy_utc, dt.datetime.now(dt.timezone.utc))
+        except Exception:  # noqa: BLE001
+            return None
+        if deals is None:
+            deals = []
+        realized_pnl_today = 0.0
+        trades_today = 0
+        for d in deals:
+            realized_pnl_today += float(d.profit) + float(d.swap) + float(d.commission) + float(getattr(d, "fee", 0.0))
+            if d.entry == mt5.DEAL_ENTRY_IN:
+                trades_today += 1
+        return {"trades_today": trades_today, "realized_pnl_today": realized_pnl_today}
 
     def get_position_status(self, ticket: int) -> dict[str, Any]:
         """Estado real de un trade por ticket -- lo que signal_orchestrator.py

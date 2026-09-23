@@ -116,9 +116,14 @@ async def _get_account_state(dispatcher: MCPDispatcher, direct_executor: MT5Dire
     MT5DirectExecutor.get_account_info(), que ya tiene su propia conexion
     directa al terminal MT5 y no depende de nada externo.
 
-    equity_start_of_day es una aproximacion (= balance actual) en el camino
-    directo -- MT5 account_info() no expone la equity de apertura del dia;
-    el camino MCP real (get_account_state) si la deriva de history_deals_get.
+    equity_start_of_day y trades_today se derivan de get_today_stats()
+    (history_deals_get desde medianoche UTC) con el MISMO criterio que el
+    camino MCP -- antes el camino directo usaba balance actual como
+    "inicio del dia" y trades_today=0 fijo, dejando el limite diario de
+    perdida y el tope de trades/dia sin efecto real en produccion (el
+    camino MCP nunca conecta, asi que el directo es el que de hecho corre
+    siempre -- ver 'mcp_account_state_fallback_to_direct' en cada tick de
+    los logs reales, y el hallazgo de 2026-09-23 en la memoria del proyecto).
     """
     try:
         return await dispatcher.get_account_state(user_id)
@@ -139,12 +144,27 @@ async def _get_account_state(dispatcher: MCPDispatcher, direct_executor: MT5Dire
         if info is None:
             raise RuntimeError("MT5DirectExecutor.get_account_info() devolvio None (sin conexion)") from exc
         positions = await asyncio.to_thread(direct_executor.get_positions)
+        stats = await asyncio.to_thread(direct_executor.get_today_stats)
+        balance = info["balance"]
+        if stats is not None:
+            trades_today = stats["trades_today"]
+            equity_start_of_day = balance - stats["realized_pnl_today"]
+            if equity_start_of_day <= 0:
+                logger.warning("equity_start_of_day_invalido", equity_start_of_day=equity_start_of_day, fallback_a=info["equity"])
+                equity_start_of_day = info["equity"]
+        else:
+            # get_today_stats() no pudo conectar (mismo motivo que get_account_info
+            # arriba, ya bajo su propio try) -- degradar al comportamiento previo
+            # en vez de reventar el tick entero por un dato secundario.
+            trades_today = 0
+            equity_start_of_day = balance
         return AccountState(
             equity=info["equity"],
-            equity_start_of_day=info["balance"],
+            equity_start_of_day=equity_start_of_day,
+            trades_today=trades_today,
             open_positions=len(positions),
             user_id=user_id,
-            balance=info["balance"],
+            balance=balance,
             free_margin=info["free_margin"],
             margin_level=info.get("margin_level"),
         )

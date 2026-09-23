@@ -3,6 +3,8 @@ version VIVA, no la copia congelada en strategies/htf_funding_btc/src/, ver
 docstring de esa copia). No reescribe logica, solo traduce su dict de salida."""
 from __future__ import annotations
 
+from typing import Any
+
 from src.brain_htf_funding import HTFFundingBrain, HTFParams
 
 from src.experts.base_expert import BaseExpert
@@ -13,8 +15,21 @@ from src.schemas.signals import PatternName, UnifiedSignal
 class SwingExpert(BaseExpert):
     def __init__(self, params: HTFParams | None = None, asset_cfg: dict | None = None) -> None:
         self.brain = HTFFundingBrain(params=params, asset_cfg=asset_cfg)
+        self._last_ts_ms: Any = None
 
     def analyze(self, snapshot: MarketSnapshot) -> UnifiedSignal | None:
+        # run_market_loop llama a cada expert cada interval_s (5s), pero una
+        # vela 1m tarda 60s en cerrar -- sin esto decide() se evaluaba ~12x
+        # sobre la MISMA vela ya cerrada (confirmado en vivo 2026-09-23:
+        # 334k evaluaciones registradas en 25 dias reales vs ~24k que predice
+        # el backtest para los mismos dias, un factor ~14x). snapshot.ts_ms
+        # es el open_time de la ultima vela 1m cerrada (ver
+        # MarketSnapshot.from_snapshot_engine) -- cambia una sola vez por
+        # vela, mismo criterio que ya usaba ScalpingExpert con `candle`.
+        if snapshot.ts_ms == self._last_ts_ms:
+            return None
+        self._last_ts_ms = snapshot.ts_ms
+
         raw = self.brain.decide(snapshot.htf_vela, snapshot.htf_context, snapshot.ts_ms)
         if raw is None:
             return None
