@@ -35,7 +35,7 @@ class HTFParams:
     breakeven más rápido/ajustado 0.8/0.3->0.5/0.2 ATR) - resultado de la
     primera corrida walk-forward (WR 38%, PF 2.0, 212 trades/mes: exceso de
     señales de baja calidad, se busca menos cantidad y mejor selección."""
-    sl_atr_mult: float = 1.2
+    sl_atr_mult: float = 1.5  # antes 1.2 -- barrido train/test 2026-09-24 (results/_sweep_wr_pf_train.json): en la misma config (cap 4.0/8.0, min_rr_net 1.3) sube WR 27.7%->36.1% y PF 2.34->3.37 en el periodo de TEST (nunca tocado al elegir), no solo en train. SL mas ajustado paraba trades por ruido antes de que el movimiento real se desarrollara.
     tp1_atr_mult: float = 2.5   # fallback si no hay zona HTF real en la dirección (ver _calc_structural_tps)
     tp2_atr_mult: float = 5.0
     # Tope: aunque la zona HTF real esté más lejos, no perseguir más de
