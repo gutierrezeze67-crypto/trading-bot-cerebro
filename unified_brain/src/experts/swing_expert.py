@@ -43,7 +43,15 @@ class SwingExpert(BaseExpert):
             direction=raw["decision"],
             entry_price=raw["entry_price"],
             sl_price=raw["stop_loss_price"],
-            tp_price=raw["tp1_price"],
+            # TP2 al broker (red de seguridad para el corredor), no TP1 --
+            # SwingBracketManager.py hace el cierre parcial en TP1 y el pase a
+            # breakeven por su cuenta (ver docstring de ese modulo). Antes esto
+            # mandaba tp1_price con el volumen COMPLETO: el broker cerraba el
+            # 100% en TP1 y el trade nunca podia llegar a TP2 -- confirmado en
+            # vivo 2026-09-25 que asi el sistema pierde en promedio (PF 0.75
+            # sobre 280 trades reconstruidos), porque el backtest valida el
+            # edge asumiendo el corredor hasta TP2, que nunca se ejecutaba.
+            tp_price=raw["tp2_price"],
             confidence=raw["conviction"] / 10.0,
             reasoning=raw.get("management_notes", ""),
             target_rr=raw.get("rr_net") or 1.0,

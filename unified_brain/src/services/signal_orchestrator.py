@@ -111,7 +111,7 @@ class SignalOrchestrator:
         emit: EmitFn,
         build_router_context: Callable[[MarketSnapshot], RouterContext],
         user_id: str = "default",
-        on_trade_executed: Callable[[ExecutionResult], None] | None = None,
+        on_trade_executed: Callable[[ExecutionResult, UnifiedSignal], None] | None = None,
         direct_executor: MT5DirectExecutor | None = None,
         risk_overrides_provider: Callable[[], dict[str, float]] | None = None,
         zone_cache: ZoneCache | None = None,
@@ -258,7 +258,7 @@ class SignalOrchestrator:
 
             _persist_trade(signal, decision, exec_result, snapshot)
             if self.on_trade_executed is not None:
-                self.on_trade_executed(exec_result)
+                self.on_trade_executed(exec_result, signal)
 
             await self.emit("trade_executed", {
                 "signal_id": signal.signal_id,

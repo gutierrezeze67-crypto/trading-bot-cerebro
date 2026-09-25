@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 # de PowerShell (esas se pierden si la sesion se cierra).
 load_dotenv(Path(__file__).resolve().parent / os.environ.get("UNIFIED_BRAIN_ENV_FILE", ".env"))
 
+from src.brain_htf_funding import HTFParams
 from src.execution.mcp_dispatcher import MCPDispatcher, MCPDispatcherConfig, MCPTransport
 from src.execution.mt5_direct import MT5DirectExecutor
 from src.experts.base_expert import NullExpert
@@ -27,6 +28,7 @@ from src.experts.scalping_expert import ScalpingExpert
 from src.experts.swing_expert import SwingExpert
 from src.risk.risk_engine import RiskEngine
 from src.risk.risk_manager import RiskManager
+from src.swing_live import SwingBracketManager
 from src.router.deterministic_router import DeterministicRouter, RouterContext
 from src.schemas.market import MarketSnapshot
 from src.schemas.risk import AccountState, RiskConfig
@@ -213,10 +215,16 @@ def build_default_orchestrator(symbol: str = "BTCUSDT", user_id: str = "default"
         cost_model = os.environ.get("UNIFIED_BRAIN_COST_MODEL", "FUNDEDNEXT_PROP")
         swing_asset_cfg = apply_cost_overlay(get_asset_config("BTCUSDT"), cost_model)
         logger.info("swing_cost_model", cost_model=cost_model, spread_bps=swing_asset_cfg.get("spread_bps"))
-        swing_expert = SwingExpert(asset_cfg=swing_asset_cfg)
+        # Instancia explicita (no None) para poder leer max_hold_hours/
+        # be_buffer_atr_mult reales abajo al armar SwingBracketManager --
+        # deben ser LOS MISMOS valores que brain.decide() uso para calcular
+        # la señal, no una copia que se pueda desincronizar.
+        htf_params = HTFParams()
+        swing_expert = SwingExpert(params=htf_params, asset_cfg=swing_asset_cfg)
     else:
         logger.info("swing_expert_disabled", reason="UNIFIED_BRAIN_ENABLE_SWING=false")
         swing_expert = NullExpert()
+        htf_params = None
     router = DeterministicRouter()
     # Lote fijo (RISK_FIXED_LOT_OVERRIDE): pensado para cuentas chicas donde
     # el risk_pct_per_trade default (0.5%) fuerza el lote minimo del broker
@@ -250,6 +258,22 @@ def build_default_orchestrator(symbol: str = "BTCUSDT", user_id: str = "default"
     if direct_executor is not None:
         logger.info("mt5_direct_execution_enabled", note="ordenes via mt5_direct.py, lecturas via mcp_dispatcher")
 
+    # TP1 parcial + breakeven + corredor a TP2, la gestion que backtest_htf.py
+    # SIEMPRE simulo pero que hasta 2026-09-25 nunca estuvo conectada al motor
+    # real (SwingExpert mandaba tp=TP1 con el volumen completo -- confirmado
+    # en vivo que asi el sistema pierde en promedio, ver swing_expert.py).
+    # Requiere direct_executor real: sin el, no hay forma de partir/modificar
+    # una posicion (el camino MCP no lo soporta).
+    swing_manager = None
+    if enable_swing and htf_params is not None and direct_executor is not None:
+        swing_manager = SwingBracketManager(
+            direct_executor, max_hold_hours=htf_params.max_hold_hours,
+            be_buffer_atr_mult=htf_params.be_buffer_atr_mult,
+            state_path=Path(__file__).resolve().parent / "swing_state.json",
+        )
+    elif enable_swing and direct_executor is None:
+        logger.error("swing_bracket_manager_disabled", reason="requiere MT5_DIRECT_EXECUTION=true para gestionar TP1/BE/TP2/max_hold")
+
     orchestrator = SignalOrchestrator(
         scalping_expert=scalping_expert,
         swing_expert=swing_expert,
@@ -262,7 +286,9 @@ def build_default_orchestrator(symbol: str = "BTCUSDT", user_id: str = "default"
         user_id=user_id,
         direct_executor=direct_executor,
         risk_overrides_provider=lambda: manager.get_risk_overrides(user_id),
+        on_trade_executed=swing_manager.register if swing_manager else None,
     )
+    orchestrator.swing_manager = swing_manager
     return orchestrator, engine, dispatcher
 
 
@@ -342,6 +368,7 @@ async def main() -> None:
             run_market_loop(engine, orchestrator, dispatcher, user_id),
             reconcile_trade_status_loop(orchestrator.direct_executor, user_id),
             server.serve(),
+            *([orchestrator.swing_manager.run()] if orchestrator.swing_manager else []),
         )
     finally:
         await dispatcher.disconnect_all()
