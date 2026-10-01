@@ -48,6 +48,15 @@ MAX_KLINES_1M = 250  # suficiente para resamplear ~80 velas de 3m
 HTF_RECALC_SECONDS = 300
 IMBALANCE_RATIO = c.IMBALANCE_RATIO
 
+# POC/VAH/VAL: mismo criterio que backtest_htf.ROLLING_1H_WINDOW (200 velas
+# de 1h = ~8 dias) -- antes de esta constante, _recalcular_htf() armaba el
+# volume profile directo sobre klines_1m (maxlen=250 = ~4h), una ventana ~48x
+# mas chica y de granularidad distinta a la validada en backtest. Confirmado
+# como causa raiz de la divergencia vivo-vs-backtest (investigacion 2026-10-01,
+# paridad real: POC/VAH/VAL daba 0.00% de diferencia vs backtest en 1106
+# velas de 15m tras este fix).
+ROLLING_1H_WINDOW_LIVE = 200
+
 # Historia de ATR%/precio para el filtro de compresion de HTFFundingBrain
 # (ver atr_compression_percentile en brain_htf_funding.HTFParams, mismo
 # criterio y misma constante que backtest_htf.ATR_RANK_LOOKBACK_BARS -- 30
@@ -62,7 +71,11 @@ ATR_RANK_MIN_PERIODS = ATR_RANK_LOOKBACK_BARS // 4
 # _recompute_atr_30m). No hay equivalentes en config/constants.py (ese
 # archivo es de order_flow_signal.py/decide(), no se toca aca).
 ATR14_15M_PERIODS = 14
-VWAP_15M_LOOKBACK_BARS = 96  # ~24h de velas 15m, ventana rolling (BTC es 24/7, no hay sesion que anclar)
+# antes 96 (~24h) -- sin cita de sweep/validacion, no coincidia con el
+# vwap_15m del backtest validado (df_15m, rolling 20, min_periods=5 - ver
+# calcular_htf() en backtest_htf.py). Corregido a 20 para paridad real
+# (investigacion 2026-10-01, diff% medio 0.03% vs backtest tras el fix).
+VWAP_15M_LOOKBACK_BARS = 20
 
 
 class SnapshotEngine:
@@ -133,12 +146,22 @@ class SnapshotEngine:
         self._m30_buffer: list = []
         self._h4_buffer: list = []
 
+        # Velas 1h agregadas (2x M30), para POC/VAH/VAL -- ver
+        # ROLLING_1H_WINDOW_LIVE / _recalcular_htf(). Backfillea por REST al
+        # arrancar (_backfill_htf_1h), mismo criterio que _backfill_swing_h4.
+        self._candles_1h: deque = deque(maxlen=ROLLING_1H_WINDOW_LIVE)
+        self._h1_buffer: list = []
+
         # Velas M15 agregadas, solo para HTFFundingBrain.decide() (atr14_15m
         # en precio directo, vwap_15m) -- ver _recompute_atr14_15m /
         # _recompute_vwap_15m. None hasta juntar suficiente historia: mejor
         # eso que un fallback inventado que produzca senales del swing sobre
         # un ATR falso (HTFFundingBrain.decide() ya trata atr14_15m=None como
         # "ATR invalido" y no dispara).
+        # Tambien backfillea por REST al arrancar (_backfill_htf_1h, que trae
+        # 15m ademas de 1h), ademas de seguir acumulando en vivo de a 1m --
+        # necesario para que cvd_trend (nuevo consumidor, ver _recalcular_htf)
+        # tenga ventana real desde el arranque, no "FLAT" forzado por buffer vacio.
         self._candles_15m: deque = deque(maxlen=500)
         self._m15_buffer: list = []
         # Historia de ATR%/precio por vela 15m cerrada, para atr_rank_30d
@@ -184,6 +207,7 @@ class SnapshotEngine:
         self._running = True
         await self._backfill_klines_1m()
         await self._backfill_swing_h4()
+        await self._backfill_htf_1h_15m()
         self._tasks = [
             asyncio.create_task(self._run_forever(), name="ws_loop"),
             asyncio.create_task(self._periodic_htf(), name="htf_loop"),
@@ -346,6 +370,51 @@ class SnapshotEngine:
             f"🕯️ Backfill REST H4 completo: {len(self._candles_h4)} velas H4 cargadas "
             f"(swing_high_h4={self._htf_cache.get('swing_high_h4')} swing_low_h4={self._htf_cache.get('swing_low_h4')})"
         )
+
+    async def _backfill_htf_1h_15m(self) -> None:
+        """Trae por REST velas YA cerradas de 1h y 15m para poblar
+        _candles_1h/_candles_15m de entrada -- mismo problema y mismo criterio
+        que _backfill_swing_h4, aplicado a POC/VAH/VAL (ROLLING_1H_WINDOW_LIVE
+        = 200 velas de 1h = ~8 dias de uptime puro sin esto) y a cvd_trend
+        (nuevo consumidor de _candles_15m desde este fix, ver _recalcular_htf).
+        Se corre DESPUES de _backfill_klines_1m(): limpia y reemplaza lo que
+        ese backfill haya alcanzado a agregar via _cerrar_vela (2xM30->1h,
+        15x1m->15m) para no mezclar un tramo reciente agregado desde 1m con
+        el resto traido directo en su granularidad nativa. Datos reales de
+        Binance, no inventados -- delta via taker_buy_base_vol, igual que el
+        resto de los backfills."""
+        loop = asyncio.get_event_loop()
+        ahora_ms = time.time() * 1000
+        for interval, limit, destino in (
+            ("1h", ROLLING_1H_WINDOW_LIVE, self._candles_1h),
+            ("15m", 200, self._candles_15m),
+        ):
+            url = KLINES_REST_URL_TMPL.format(symbol=self.symbol, interval=interval, limit=limit)
+            try:
+                resp = await loop.run_in_executor(None, lambda u=url: requests.get(u, timeout=15))
+                raw = resp.json()
+            except Exception as e:
+                logger.error(f"❌ Error trayendo backfill REST de klines {interval}: {e}")
+                continue
+            if not isinstance(raw, list) or not raw:
+                logger.warning(f"⚠️ Backfill REST de klines {interval} vacío o inválido")
+                continue
+
+            destino.clear()
+            for k in raw:
+                open_time_ms, o, h, l, c_, vol, close_time_ms, _, _, taker_buy_vol, *_ = k
+                if close_time_ms > ahora_ms:
+                    continue
+                buy_vol = float(taker_buy_vol)
+                volume = float(vol)
+                destino.append({
+                    "open_time": open_time_ms / 1000,
+                    "open": float(o), "high": float(h), "low": float(l), "close": float(c_),
+                    "volume": volume, "delta": buy_vol - max(volume - buy_vol, 0.0),
+                })
+            logger.info(f"🕯️ Backfill REST {interval} completo: {len(destino)} velas cargadas")
+
+        self._recalcular_htf()
 
     async def _bootstrap_orderbook(self) -> None:
         """Snapshot REST del book, requerido por Binance antes de aplicar el
@@ -599,6 +668,7 @@ class SnapshotEngine:
         candle["initiative_pullback"] = self._evaluar_initiative_pullback(candle)
         candle["breakout_vol"] = self._evaluar_breakout_vol(candle)
         candle["liquidity_zone"] = self._evaluar_liquidity_zone(candle)
+        candle["div"] = self._evaluar_div(candle)
 
         self.klines_1m.append(candle)
 
@@ -627,6 +697,15 @@ class SnapshotEngine:
                 self._candles_h4.append(h4)
                 self._h4_buffer = []
                 self._recompute_swings_h4()
+
+            # 2x M30 -> 1h, para POC/VAH/VAL (ver ROLLING_1H_WINDOW_LIVE /
+            # _recalcular_htf). _aggregate_to_h4 es generica sobre N pese al
+            # nombre (ver su docstring), reutilizada tal cual.
+            self._h1_buffer.append(m30)
+            if len(self._h1_buffer) == 2:
+                h1 = self._aggregate_to_h4(self._h1_buffer)
+                self._candles_1h.append(h1)
+                self._h1_buffer = []
 
         # Agregación M15 -> atr14_15m (precio) + vwap_15m, solo para
         # HTFFundingBrain.decide() (ver comentario de _candles_15m arriba).
@@ -707,6 +786,24 @@ class SnapshotEngine:
         """Que TFs (15/60/240/1440) cerraron vela en el ULTIMO
         _cerrar_vela_actual() -- vacio la gran mayoria de los cierres."""
         return list(self._closed_tfs_this_close)
+
+    def _evaluar_div(self, candle: dict) -> bool:
+        """Divergencia de delta (patron DELTA_DIV, ver brain_htf_funding.py
+        linea ~177: `if vela.get("div"): return "DELTA_DIV", ...`). Antes
+        candle["div"] quedaba hardcodeado en False para siempre en
+        klines_1m (el unico buffer que lee MarketSnapshot.from_snapshot_engine
+        -> decide()): ofd._mark_delta_divergence() SI se llamaba, pero sobre
+        otras listas (snapshot/Sensei, solo display) -- DELTA_DIV nunca podia
+        disparar una señal real en vivo, aunque el backtest si lo computa
+        (calcular_features_1m). Reusa la MISMA funcion que ya usa el backtest,
+        sin reimplementarla: zero-look-ahead, la ventana de 5 son velas YA
+        cerradas antes de esta."""
+        previas = list(self.klines_1m)[-5:]
+        if len(previas) < 5:
+            return False
+        ventana = previas + [candle]
+        ofd._mark_delta_divergence(ventana)
+        return bool(ventana[-1].get("div", False))
 
     def _evaluar_stop_run(self, candle: dict) -> Optional[str]:
         """Stop Run / Liquidity Sweep v2 -- delega a ofd.evaluar_stop_run()
@@ -871,6 +968,8 @@ class SnapshotEngine:
         if len(velas) < c.HTF_READY_MINUTES:
             return
 
+        # df de 1m: SOLO para naked_pocs/liq_clusters, que no alimentan
+        # decide() (son para el snapshot/narrador) -- no se tocan en este fix.
         df = pd.DataFrame([{
             "open_time": pd.Timestamp.fromtimestamp(v["_open_time"], tz="UTC"),
             "close_time": pd.Timestamp.fromtimestamp(v["_open_time"], tz="UTC"),
@@ -879,10 +978,31 @@ class SnapshotEngine:
         } for v in velas])
         df["cvd"] = df["delta"].cumsum()
 
-        vp = ofd.volume_profile(df)
+        # POC/VAH/VAL: sobre velas de 1h (paridad con backtest_htf.calcular_htf,
+        # ROLLING_1H_WINDOW=200 -- ver ROLLING_1H_WINDOW_LIVE). Antes se
+        # calculaba sobre klines_1m (~4h, granularidad de 1m): causa raiz
+        # confirmada de la divergencia vivo-vs-backtest (investigacion 2026-10-01).
+        velas_1h = list(self._candles_1h)
+        if velas_1h:
+            df_1h = pd.DataFrame(velas_1h)
+            vp = ofd.volume_profile(df_1h)
+        else:
+            vp = {"poc": 0.0, "vah": 0.0, "val": 0.0}
+
+        # cvd_trend: sobre velas de 15m (paridad con backtest_htf.calcular_htf,
+        # slope de 20 velas 15m = ~5h -- ver ofd.cvd_trend). Antes tambien
+        # salia del df de 1m (ventana real de 20 MINUTOS, no 5 horas).
+        velas_15m = list(self._candles_15m)
+        if len(velas_15m) >= 2:
+            df_15m = pd.DataFrame(velas_15m)
+            df_15m["cvd"] = df_15m["delta"].cumsum()
+            cvd_trend_val = ofd.cvd_trend(df_15m, lookback=20)
+        else:
+            cvd_trend_val = "FLAT"
+
         self._htf_cache = {
             "poc": vp["poc"], "vah": vp["vah"], "val": vp["val"],
-            "cvd_trend": ofd.cvd_trend(df),
+            "cvd_trend": cvd_trend_val,
             "naked_pocs": ofd.naked_pocs(df),
             "liq_clusters": ofd.liquidity_clusters(df),
             # atr_30m/swings se recalculan aparte, al cerrar M30/H4 (ver
@@ -895,7 +1015,7 @@ class SnapshotEngine:
             "vwap_15m": self._htf_cache.get("vwap_15m"),
             "atr_rank_30d": self._htf_cache.get("atr_rank_30d"),
         }
-        logger.info(f"📊 HTF recalculado: POC={vp['poc']} VAH={vp['vah']} VAL={vp['val']}")
+        logger.info(f"📊 HTF recalculado: POC={vp['poc']} VAH={vp['vah']} VAL={vp['val']} CVD={cvd_trend_val}")
 
     def _aggregate_to_m30(self, candles_1m: list) -> dict:
         """Agrega N velas 1m cerradas -> 1 vela agregada (generica pese al
