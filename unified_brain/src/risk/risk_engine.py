@@ -26,6 +26,16 @@ class RiskEngine:
     def pre_flight(self, account: AccountState, signal: UnifiedSignal) -> RiskCheckResult:
         log = logger.bind(signal_id=signal.signal_id, strategy_type=signal.strategy_type)
 
+        if self.config.max_total_loss_pct is not None and account.total_pnl_pct is not None:
+            if account.total_pnl_pct <= -self.config.max_total_loss_pct:
+                result = RiskCheckResult(
+                    allowed=False,
+                    code="MAX_TOTAL_LOSS",
+                    msg=f"Total PnL {account.total_pnl_pct:.2%} <= -{self.config.max_total_loss_pct:.2%} (piso estatico desde {account.equity_start_of_challenge})",
+                )
+                log.warning("risk_blocked", code=result.code, msg=result.msg)
+                return result
+
         if account.daily_pnl_pct <= -self.config.max_daily_loss_pct:
             result = RiskCheckResult(
                 allowed=False,

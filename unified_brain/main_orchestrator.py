@@ -169,6 +169,10 @@ async def _get_account_state(dispatcher: MCPDispatcher, direct_executor: MT5Dire
             balance=balance,
             free_margin=info["free_margin"],
             margin_level=info.get("margin_level"),
+            # Mismo env var que ya usa build_default_orchestrator() para
+            # capital_inicial -- piso FIJO para RiskConfig.max_total_loss_pct
+            # (ver docstring ahi). Inocuo si ese chequeo esta desactivado.
+            equity_start_of_challenge=float(os.environ.get("UNIFIED_BRAIN_CAPITAL_INICIAL", "50000")),
         )
 
 
@@ -248,6 +252,10 @@ def build_default_orchestrator(symbol: str = "BTCUSDT", user_id: str = "default"
         # via env si se usa RISK_FIXED_LOT_OVERRIDE.
         max_position_equity_pct=float(os.environ.get("RISK_MAX_POSITION_EQUITY_PCT", "3.0")),
         fixed_lot_override=float(fixed_lot_raw) if fixed_lot_raw else None,
+        # None (default) desactiva el freno estatico -- solo lo activan
+        # cuentas de evaluacion de prop firm con un piso fijo (ver
+        # RiskConfig.max_total_loss_pct / AccountState.equity_start_of_challenge).
+        max_total_loss_pct=float(os.environ["RISK_MAX_TOTAL_LOSS_PCT"]) if os.environ.get("RISK_MAX_TOTAL_LOSS_PCT", "").strip() else None,
     )
     if risk_config.fixed_lot_override is not None:
         logger.info("risk_fixed_lot_override_enabled", lot=risk_config.fixed_lot_override)

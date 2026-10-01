@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 BlockCode = Literal[
     "OK",
     "MAX_DD",
+    "MAX_TOTAL_LOSS",
     "MAX_TRADES",
     "MAX_POSITIONS",
     "SIZE_ANOMALY",
@@ -23,6 +24,15 @@ BlockCode = Literal[
 
 class RiskConfig(BaseModel):
     max_daily_loss_pct: float = Field(gt=0, le=1.0, default=0.02)
+    max_total_loss_pct: float | None = Field(
+        gt=0, le=1.0, default=None,
+        description="Piso ESTATICO sobre el balance inicial del desafio (nunca se mueve, "
+        "a diferencia de max_daily_loss_pct que resetea cada dia) -- ver AccountState."
+        "equity_start_of_challenge. None (default) desactiva el chequeo, preserva el "
+        "comportamiento previo (solo freno diario). Pensado para evaluaciones de prop firm "
+        "con un limite de perdida total fijo (ej. Funding Pips 1 Step Flex: 12% estatico "
+        "desde el balance de arranque, investigacion 2026-10-01).",
+    )
     max_trades_per_day: int = Field(gt=0, default=5)
     max_concurrent_positions: int = Field(gt=0, default=1)
     risk_pct_per_trade: float = Field(gt=0, le=1.0, default=0.005)
@@ -68,6 +78,12 @@ class AccountState(BaseModel):
     open_positions: int = Field(ge=0, default=0)
     trades_today: int = Field(ge=0, default=0)
     loss_streak: int = Field(ge=0, default=0, description="no viene de MT5 hoy -- mcp_dispatcher.get_account_state no lo deriva de history_deals_get todavia")
+    equity_start_of_challenge: float | None = Field(
+        default=None, gt=0,
+        description="Balance con el que arranco la evaluacion de prop firm (fijo, nunca "
+        "cambia) -- fuente: UNIFIED_BRAIN_CAPITAL_INICIAL. None desactiva el chequeo "
+        "MAX_TOTAL_LOSS en RiskEngine.pre_flight() (ver RiskConfig.max_total_loss_pct).",
+    )
 
     # Campos que solo llena mcp_dispatcher.get_account_state() (cuenta MT5
     # real via MCP) -- quedan en None para AccountState construido desde
@@ -85,6 +101,12 @@ class AccountState(BaseModel):
     @property
     def daily_pnl_pct(self) -> float:
         return self.daily_pnl_usdt / self.equity_start_of_day
+
+    @property
+    def total_pnl_pct(self) -> float | None:
+        if self.equity_start_of_challenge is None:
+            return None
+        return (self.equity - self.equity_start_of_challenge) / self.equity_start_of_challenge
 
 
 class RiskCheckResult(BaseModel):
